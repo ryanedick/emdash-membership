@@ -1,6 +1,6 @@
 {
   "name": "emdash-memberships",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Member accounts for EmDash sites: passwordless magic-link sign-in, sessions, Stripe subscriptions and one-time purchases, and comp Pro time. Runs on Cloudflare D1.",
   "keywords": [
     "emdash",
