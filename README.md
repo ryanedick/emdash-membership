@@ -283,6 +283,10 @@ npm run typecheck
 npm run build     # emits dist/
 ```
 
+## Disclaimer
+
+This software is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages or other liability arising from, out of or in connection with the software or its use. You are responsible for reviewing and testing it before using it to handle accounts, personal data or payments on your site. See the [LICENSE](./LICENSE) for the full terms.
+
 ## License
 
 [MIT](./LICENSE)
