@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- New EmDash plugin, `emdash-memberships/plugin`: a Members area in the EmDash admin (overview with MRR, member search, member detail with comp time, sign out everywhere and erase, early members with CSV export), a dashboard widget and MCP tools. Admins only by default.
+- New queries for staff tools: `memberStats`, `listMembers`, `getMemberDetail`, `signOutEverywhere`, `deleteMember`.
+- `emdash` and `zod` are optional peer dependencies, needed only for the plugin.
+
 ## 0.1.0
 
 First public release.

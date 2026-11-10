@@ -6,6 +6,7 @@ Member accounts for [EmDash](https://github.com/emdash-cms/emdash) sites on Clou
 - **Free and Pro plans.** `Astro.locals.member.plan` tells every page what the visitor may see.
 - **Stripe, optional.** Checkout, the Customer Portal, and a webhook handler that turns payments, refunds and disputes into access.
 - **Comp time.** Give someone Pro for N days without Stripe, once per idempotency key, stacking end to end.
+- **Members admin.** An optional EmDash plugin adds a Members area to `/_emdash/admin`: stats and MRR, member search, each member's billing and comp history, give or revoke Pro time, sign out everywhere, erase, and early-member export. Plus MCP tools for agents.
 - **Runs on D1.** Tables are created on first use. No migration step.
 
 These are site visitors (readers, subscribers). They're separate from EmDash staff users, who sign in to `/_emdash/admin`.
@@ -185,6 +186,48 @@ How it behaves:
 ### One-time "early access" purchases
 
 An offer with `mode: "payment", grantsEarlyAccess: true` gives Pro with no end date and a permanent early-member badge. When you're ready to charge subscriptions, `startPaidLaunch(db, { graceDays: 14 })` gives every early member a grace period; `expireGracePeriods`, `dueNotices` and `markNoticeSent` run the rest from a scheduled job (launch email, reminder, "you're on Free now"). `earlyMemberCouponId` discounts their first subscription. `listEarlyMembers(db)` exports them.
+
+## Members admin (EmDash plugin)
+
+Register the plugin to get a **Members** area in the EmDash admin. Sign-in and billing keep running from your site's routes; the plugin is the staff side.
+
+```js
+// astro.config.mjs
+import { membershipsPlugin } from "emdash-memberships/plugin";
+
+emdash({
+	plugins: [
+		membershipsPlugin({
+			d1Binding: "DB",
+			// Optional: show MRR (list price, before coupons). Keys are Stripe Price lookup keys.
+			planValues: {
+				pro_monthly: { amount: 900, interval: "month" },
+				pro_annual: { amount: 9000, interval: "year" },
+			},
+		}),
+	],
+});
+```
+
+It needs `emdash` and `zod` (both already in an EmDash site). Pages:
+
+- **Members**: totals, Pro vs Free, paying subscriptions, canceling and past-due counts, early members, comp-only Pro, MRR, and new members per day. Also a dashboard widget.
+- **All members**: search by email, filter by plan or early-member badge, and give any address Pro time.
+- **A member**: plan and why they have it, subscriptions, early access and grace period, a link to their Stripe customer, comp time (give or revoke), sign out on every device, and erase. Erasing is refused while a subscription is live: cancel it in Stripe first.
+- **Early members**: everyone with the badge, with a CSV export.
+
+MCP tools: `members_stats`, `members_find`, `members_get`, `members_grant_pro`.
+
+| Option | Default | |
+|---|---|---|
+| `d1Binding` | `"DB"` | D1 binding with the `mbr_` tables |
+| `permission` | `"users:manage"` | Who can open it. Admins only by default, since it shows personal and billing data |
+| `proStatuses` | active, trialing, past_due | Must match your billing config |
+| `planValues` | none | Value per Price lookup key, for MRR. Omit to hide MRR |
+| `currency` | `"USD"` | For MRR |
+| `stripeDashboardUrl` | `https://dashboard.stripe.com` | Base for customer links; add `/test` in test mode |
+
+The same queries are exported for other back offices: `memberStats`, `listMembers`, `getMemberDetail`, `signOutEverywhere`, `deleteMember`.
 
 ## Comp Pro time
 

@@ -57,3 +57,16 @@ export {
 	recomputePlan,
 	startPaidLaunch,
 } from "./launch.ts";
+export {
+	type DeleteMemberResult,
+	deleteMember,
+	getMemberDetail,
+	listMembers,
+	type MemberDetail,
+	type MemberListItem,
+	type MemberQuery,
+	type MemberStats,
+	memberStats,
+	type PlanValue,
+	signOutEverywhere,
+} from "./admin.ts";
