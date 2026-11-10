@@ -1,0 +1,7 @@
+---
+// `dev` is only ever set when membershipsAstro({ dev: true }), i.e. `astro dev`.
+const devLink = Astro.url.searchParams.get("dev");
+---
+<h1>Check your inbox</h1>
+<p>If that address can sign in, a link is on its way. It works once and expires in 15 minutes.</p>
+{import.meta.env.DEV && devLink && <p>Dev only: <a href={devLink}>open the sign-in link</a></p>}

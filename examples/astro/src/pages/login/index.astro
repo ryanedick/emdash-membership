@@ -1,0 +1,21 @@
+---
+const error = Astro.url.searchParams.get("error");
+const email = Astro.url.searchParams.get("email") ?? "";
+const next = Astro.url.searchParams.get("next") ?? "";
+const messages: Record<string, string> = {
+	email: "That doesn't look like an email address.",
+	rate: "Too many sign-in links requested. Try again in an hour.",
+	send: "We couldn't send the email. Please try again.",
+	verify: "Please complete the check and try again.",
+	expired: "That link has expired or was already used. Request a new one.",
+};
+---
+<h1>Sign in</h1>
+{error && <p role="alert">{messages[error] ?? "Something went wrong."}</p>}
+<form method="post" action="/api/auth/login">
+	<label>Email <input type="email" name="email" value={email} required autocomplete="email" /></label>
+	<input type="hidden" name="next" value={next} />
+	<!-- Honeypot: hidden from people, bots fill it in -->
+	<input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true" />
+	<button type="submit">Email me a sign-in link</button>
+</form>

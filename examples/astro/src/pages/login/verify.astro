@@ -1,0 +1,24 @@
+---
+// GET only checks the link. The button POSTs to use it, so email scanners
+// that pre-open links can't burn the token.
+import { members } from "../../lib/members";
+
+const link = await members.peekLoginLink(Astro);
+---
+{
+	link ? (
+		<>
+			<h1>Finish signing in</h1>
+			<p>Signing in as <strong>{link.email}</strong>.</p>
+			<form method="post" action="/api/auth/verify">
+				<input type="hidden" name="token" value={link.token} />
+				<button type="submit">Sign in</button>
+			</form>
+		</>
+	) : (
+		<>
+			<h1>This link has expired</h1>
+			<p><a href="/login">Get a new link</a></p>
+		</>
+	)
+}

@@ -1,0 +1,8 @@
+// Add to your EmDash site's wrangler.jsonc. EmDash sites already have the DB binding.
+{
+	"d1_databases": [{ "binding": "DB", "database_name": "my-site", "database_id": "…" }],
+	// Sign-in email through Cloudflare Email Service. Lock it to your sender address.
+	"send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["signin@mail.example.com"] }],
+	// Optional: runs expireGrants / the paid-launch jobs (see README, "Scheduled jobs").
+	"triggers": { "crons": ["*/5 * * * *"] }
+}

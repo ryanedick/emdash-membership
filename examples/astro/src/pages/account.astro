@@ -1,0 +1,8 @@
+---
+const member = Astro.locals.member;
+if (!member) return Astro.redirect("/login?next=/account");
+---
+<h1>Your account</h1>
+<p>{member.email} · {member.plan === "pro" ? "Pro" : "Free"}</p>
+<form method="post" action="/api/billing/portal"><button>Manage billing</button></form>
+<form method="post" action="/api/auth/logout"><button>Sign out</button></form>

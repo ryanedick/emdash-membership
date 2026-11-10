@@ -1,0 +1,78 @@
+{
+  "name": "emdash-memberships",
+  "version": "0.1.0",
+  "description": "Member accounts for EmDash sites: passwordless magic-link sign-in, sessions, Stripe subscriptions and one-time purchases, and comp Pro time. Runs on Cloudflare D1.",
+  "keywords": [
+    "emdash",
+    "emdash-plugin",
+    "astro",
+    "cloudflare",
+    "d1",
+    "memberships",
+    "magic-link",
+    "paywall",
+    "stripe",
+    "subscriptions"
+  ],
+  "license": "MIT",
+  "author": "Ryan Edick",
+  "homepage": "https://github.com/ryanedick/emdash-membership#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ryanedick/emdash-membership.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ryanedick/emdash-membership/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./astro": {
+      "types": "./dist/astro.d.ts",
+      "default": "./dist/astro.js"
+    },
+    "./stripe": {
+      "types": "./dist/stripe.d.ts",
+      "default": "./dist/stripe.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test --experimental-strip-types \"test/*.test.ts\"",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "astro": ">=5.0.0",
+    "stripe": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "astro": {
+      "optional": true
+    },
+    "stripe": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "astro": "^7.3.2",
+    "stripe": "^23.0.0",
+    "typescript": "^6.0.3"
+  }
+}
