@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+Set up from the admin, no environment variables needed.
+
+- **Members → Connections:** enter the Stripe secret key, the webhook signing secret and the Turnstile keys in write-only fields. EmDash stores them encrypted (plugin `settingsSchema` secret fields) and never sends them back; the page shows where each key comes from, its mode and last four characters.
+- **One-click Stripe webhook:** creates the endpoint with all 12 events and saves its signing secret (replacing an older endpoint for the same address). **Test connection** checks the key and its permissions.
+- `createBillingFromSettings()` builds billing from the saved keys (falling back to `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`) and returns null until a key is set. `billingRoutes({ billing })` accepts an async factory.
+- `getMembershipSecrets()`, `turnstileFromSettings()` and `stripeClientFor()` for site code.
+- The Stripe webhook answers 503 (so Stripe retries) while no signing secret is set, instead of rejecting the signature.
+- The restricted Stripe key needs Webhook Endpoints write access for the one-click webhook.
+
 ## 0.3.0
 
 Plans and entitlements, real billing, access rules, gifts, teams, downloads, a cancel flow, webhooks and import/export. Backward compatible: 0.2 sites keep working without changes.

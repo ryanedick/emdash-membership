@@ -29,6 +29,7 @@ import {
 	safeNextPath,
 } from "./memberships.ts";
 import type { Billing } from "./stripe.ts";
+import { getMembershipSecrets } from "./settings.ts";
 import { type DownloadBucket, fetchDownload } from "./downloads.ts";
 import { redeemGift } from "./gifts.ts";
 import { needsOnboarding, saveProfile, listProfileFields } from "./profile.ts";
@@ -96,8 +97,12 @@ export interface MembershipsAstroConfig {
 }
 
 export interface BillingRoutesConfig<OfferKey extends string = string> {
-	/** E.g. `() => createBilling({ … })`. */
-	billing: Lazy<Billing>;
+	/**
+	 * E.g. `() => createBillingFromSettings({ db: env.DB })` (keys from the Members
+	 * admin), or `() => createBilling({ … })`. May be async; null means billing
+	 * isn't set up yet and the routes answer "unavailable".
+	 */
+	billing: Lazy<Billing | null | Promise<Billing | null>>;
 	/** Offers a member may buy right now. Default: every offer is allowed. */
 	purchasable?: (member: Member) => readonly OfferKey[] | Promise<readonly OfferKey[]>;
 	/** False turns the routes off (503 / redirect), e.g. while Stripe keys aren't set. Default true. */
@@ -105,6 +110,19 @@ export interface BillingRoutesConfig<OfferKey extends string = string> {
 }
 
 type Ctx = Pick<APIContext, "request" | "url" | "cookies" | "locals" | "redirect">;
+
+/**
+ * A `verifyHuman` check using the Turnstile secret saved on Members →
+ * Connections (or TURNSTILE_SECRET_KEY). Lets everyone through until a secret is set.
+ *
+ *   membershipsAstro({ verifyHuman: turnstileFromSettings(), … })
+ */
+export function turnstileFromSettings(opts: { fetch?: typeof fetch } = {}) {
+	return async (form: FormData, ip: string | null): Promise<boolean> => {
+		const { turnstileSecret } = await getMembershipSecrets();
+		return turnstileVerifier(turnstileSecret ?? undefined, opts)(form, ip);
+	};
+}
 
 /**
  * A `verifyHuman` check for Cloudflare Turnstile: put the widget in your
@@ -376,15 +394,24 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 
 	/** Stripe routes: webhook, checkout and Customer Portal. */
 	function billingRoutes<OfferKey extends string>(b: BillingRoutesConfig<OfferKey>) {
-		const enabled = () => (b.enabled === undefined ? true : resolve(b.enabled));
-		const billing = () => resolve(b.billing);
+		/** The billing instance, or null when it's switched off or not configured yet. */
+		const load = async (): Promise<Billing | null> => {
+			if (b.enabled !== undefined && !resolve(b.enabled)) return null;
+			try {
+				return (await resolve(b.billing)) ?? null;
+			} catch (err) {
+				console.error("[memberships] billing could not be created", err);
+				return null;
+			}
+		};
 
 		/** POST. Point the Stripe webhook endpoint here (see `BILLING_WEBHOOK_EVENTS`). */
 		const webhookRoute: APIRoute = async ({ request }: Ctx) => {
-			if (!enabled()) return new Response("billing not configured", { status: 503 });
+			const billing = await load();
+			if (!billing) return new Response("billing not configured", { status: 503 });
 			// Raw body: parsing JSON first would break signature verification.
 			const raw = await request.text();
-			const { status, body } = await billing().handleWebhook(raw, request.headers.get("stripe-signature"));
+			const { status, body } = await billing.handleWebhook(raw, request.headers.get("stripe-signature"));
 			return new Response(body, { status });
 		};
 
@@ -397,12 +424,13 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 			if (!member) return redirect(withParams(paths.login, { next: paths.pricing }), 303);
 
 			const unavailable = () => redirect(withParams(paths.pricing, { checkout: "unavailable" }), 303);
-			if (!enabled()) return unavailable();
 			if (b.purchasable && !(await b.purchasable(member)).includes(offer)) return unavailable();
+			const billing = await load();
+			if (!billing) return unavailable();
 
 			let result: Awaited<ReturnType<Billing["startCheckout"]>>;
 			try {
-				result = await billing().startCheckout({
+				result = await billing.startCheckout({
 					member,
 					offer,
 					successUrl: new URL(paths.billingSuccess, url).toString(),
@@ -422,22 +450,24 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		const portalRoute: APIRoute = async (ctx: Ctx) => {
 			const member = localsOf(ctx).member;
 			if (!member) return ctx.redirect(withParams(paths.login, { next: paths.account }), 303);
-			if (!enabled()) return ctx.redirect(paths.account, 303);
-			const portal = await billing().portalUrl(member, new URL(paths.account, ctx.url).toString());
+			const billing = await load();
+			if (!billing) return ctx.redirect(paths.account, 303);
+			const portal = await billing.portalUrl(member, new URL(paths.account, ctx.url).toString());
 			return ctx.redirect(portal ?? paths.account, 303);
 		};
 
-		const requireBilling = (ctx: Ctx, back: string) => {
+		const requireBilling = async (ctx: Ctx, back: string) => {
 			const { member, redirect } = signedIn(ctx, back);
 			if (!member) return { member: null, billing: null, response: redirect! };
-			if (!enabled()) return { member, billing: null, response: ctx.redirect(withParams(back, { error: "billing_unavailable" }), 303) };
-			return { member, billing: billing(), response: null };
+			const billing = await load();
+			if (!billing) return { member, billing: null, response: ctx.redirect(withParams(back, { error: "billing_unavailable" }), 303) };
+			return { member, billing, response: null };
 		};
 
 		/** POST, form field `price` (a recurring price's lookup key). Moves the member's subscription. */
 		const changePlanRoute: APIRoute = async (ctx: Ctx) => {
 			const form = await ctx.request.formData().catch(() => null);
-			const { member, billing: b2, response } = requireBilling(ctx, paths.account);
+			const { member, billing: b2, response } = await requireBilling(ctx, paths.account);
 			if (response) return response;
 			const r = await b2!.changePlan(member!.id, String(form?.get("price") ?? ""));
 			return ctx.redirect(withParams(paths.account, r.ok ? { saved: "plan" } : { error: r.reason }), 303);
@@ -450,7 +480,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		 */
 		const cancelRoute: APIRoute = async (ctx: Ctx) => {
 			const form = await ctx.request.formData().catch(() => null);
-			const { member, billing: b2, response } = requireBilling(ctx, paths.cancel);
+			const { member, billing: b2, response } = await requireBilling(ctx, paths.cancel);
 			if (response) return response;
 			const reason = String(form?.get("reason") ?? "");
 			const comment = String(form?.get("comment") ?? "") || null;
@@ -463,7 +493,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 
 		/** POST. Undoes a cancellation scheduled for the period end, or ends a pause. */
 		const resumeRoute: APIRoute = async (ctx: Ctx) => {
-			const { member, billing: b2, response } = requireBilling(ctx, paths.account);
+			const { member, billing: b2, response } = await requireBilling(ctx, paths.account);
 			if (response) return response;
 			const r = await b2!.resumeSubscription(member!.id);
 			const r2 = r.ok ? r : await b2!.unpauseSubscription(member!.id);
@@ -473,7 +503,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		/** POST: `price` (a gift price), optional `recipient_email`, `recipient_name`, `message`, `deliver_on` (YYYY-MM-DD). */
 		const giftCheckoutRoute: APIRoute = async (ctx: Ctx) => {
 			const form = await ctx.request.formData().catch(() => null);
-			const { member, billing: b2, response } = requireBilling(ctx, "/gift");
+			const { member, billing: b2, response } = await requireBilling(ctx, "/gift");
 			if (response) return response;
 			const on = String(form?.get("deliver_on") ?? "");
 			const deliverAt = on ? Date.parse(`${on}T09:00:00Z`) : null;
@@ -493,7 +523,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		/** POST: `price` (a per-seat price), `seats`, `team_name`. */
 		const teamCheckoutRoute: APIRoute = async (ctx: Ctx) => {
 			const form = await ctx.request.formData().catch(() => null);
-			const { member, billing: b2, response } = requireBilling(ctx, paths.pricing);
+			const { member, billing: b2, response } = await requireBilling(ctx, paths.pricing);
 			if (response) return response;
 			const r = await b2!.startTeamCheckout({
 				member: member!,
@@ -509,7 +539,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		/** POST: `team`, `seats`. Team admins change the seat count (prorated). */
 		const teamSeatsRoute: APIRoute = async (ctx: Ctx) => {
 			const form = await ctx.request.formData().catch(() => null);
-			const { member, billing: b2, response } = requireBilling(ctx, paths.team);
+			const { member, billing: b2, response } = await requireBilling(ctx, paths.team);
 			if (response) return response;
 			const teamId = String(form?.get("team") ?? "");
 			if (!(await isTeamAdmin(db(), teamId, member!.id)) || !(await getTeam(db(), { id: teamId }))) return ctx.redirect(withParams(paths.team, { error: "not_admin" }), 303);
@@ -517,7 +547,7 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 			return ctx.redirect(withParams(paths.team, r.ok ? { team: teamId, saved: "seats" } : { team: teamId, error: r.error ?? r.reason }), 303);
 		};
 
-		return { webhookRoute, checkoutRoute, portalRoute, changePlanRoute, cancelRoute, resumeRoute, giftCheckoutRoute, teamCheckoutRoute, teamSeatsRoute };
+		return { load, webhookRoute, checkoutRoute, portalRoute, changePlanRoute, cancelRoute, resumeRoute, giftCheckoutRoute, teamCheckoutRoute, teamSeatsRoute };
 	}
 
 	return {

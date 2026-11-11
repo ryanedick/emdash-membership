@@ -22,6 +22,7 @@ import { type EmailData, type EmailKind, enqueueEmail, getLifecycleSettings } fr
 import type { Member } from "./memberships.ts";
 import { getPlan, getPrice, type PlanPrice } from "./plans.ts";
 import { mrrMovement, mrrOf } from "./revenue.ts";
+import { getMembershipSecrets, type SecretsOptions } from "./settings.ts";
 
 export * from "./catalog.ts";
 export * from "./launch.ts";
@@ -884,6 +885,8 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 		 */
 		async handleWebhook(rawBody: string, signature: string | null): Promise<{ status: number; body: string }> {
 			if (!signature) return { status: 400, body: "missing signature" };
+			// Not set up yet: 503 makes Stripe retry later instead of dropping the event.
+			if (!config.webhookSecret) return { status: 503, body: "webhook signing secret not set" };
 			let event: Stripe.Event;
 			try {
 				event = await stripe.webhooks.constructEventAsync(
@@ -925,6 +928,34 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 }
 
 export type Billing = ReturnType<typeof createBilling>;
+
+let stripeClient: { key: string; client: Stripe } | null = null;
+
+/** A Stripe client for a key, reused across requests in this isolate. Needs the `stripe` package. */
+export async function stripeClientFor(key: string): Promise<Stripe> {
+	if (stripeClient?.key === key) return stripeClient.client;
+	const { default: StripeCtor } = (await import("stripe" as string)) as { default: typeof Stripe };
+	// No apiVersion: the SDK pins the version its types were generated for.
+	const client = new StripeCtor(key, { httpClient: StripeCtor.createFetchHttpClient(), maxNetworkRetries: 2 });
+	stripeClient = { key, client };
+	return client;
+}
+
+/**
+ * Billing with the Stripe keys saved in the Members admin (or, failing that,
+ * the STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET environment variables).
+ * Returns null while no secret key is set, so routes can show "not available".
+ *
+ *   billing: () => createBillingFromSettings({ db: env.DB, earlyMemberCouponId: "EARLY50" })
+ */
+export async function createBillingFromSettings<OfferKey extends string>(
+	config: Omit<BillingConfig<OfferKey>, "stripe" | "webhookSecret"> & { secrets?: SecretsOptions; stripe?: Stripe },
+): Promise<Billing | null> {
+	const s = await getMembershipSecrets(config.secrets);
+	if (!s.stripeSecretKey && !config.stripe) return null;
+	const stripe = config.stripe ?? (await stripeClientFor(s.stripeSecretKey!));
+	return createBilling({ ...config, stripe, webhookSecret: s.stripeWebhookSecret ?? "" });
+}
 
 /** The webhook events `handleWebhook` acts on. Subscribe the endpoint to exactly these. */
 export const BILLING_WEBHOOK_EVENTS = [

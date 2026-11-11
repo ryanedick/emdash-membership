@@ -69,6 +69,7 @@ import {
 	when,
 } from "./blocks.ts";
 import { MORE_PAGES, memberExtras, moreActions } from "./admin-more.ts";
+import { connectionsAction, connectionsPage } from "./admin-connections.ts";
 import { audit } from "../events.ts";
 
 export type { AdminDeps, AdminResponse } from "./blocks.ts";
@@ -718,6 +719,8 @@ async function act(c: Ctx, i: Interaction): Promise<AdminResponse> {
 	const [area, verb, ...rest] = (i.action_id ?? "").split(":");
 	const id = rest.join(":") || (typeof i.value === "string" ? i.value : "");
 	const v = i.values ?? {};
+	const conn = await connectionsAction(c, i);
+	if (conn) return conn;
 	const more = await moreActions(c, i, (memberId) => memberPage(c, memberId));
 	if (more) return more;
 	const ok = (r: AdminResponse, message: string): AdminResponse => ({ ...r, toast: { type: "success", message } });
@@ -968,6 +971,8 @@ async function renderPage(c: Ctx, page: string): Promise<AdminResponse> {
 			return emailsPage(c);
 		case "/early":
 			return earlyPage(c);
+		case "/connections":
+			return connectionsPage(c);
 		default:
 			if (MORE_PAGES[path]) return MORE_PAGES[path](c);
 			return overviewPage(c);
@@ -977,7 +982,7 @@ async function renderPage(c: Ctx, page: string): Promise<AdminResponse> {
 export async function handleAdmin(db: Db, input: unknown, options: PluginOptions = {}, deps: AdminDeps | number = {}): Promise<AdminResponse> {
 	const d: AdminDeps = typeof deps === "number" ? { now: deps } : deps;
 	const i = (input ?? {}) as Interaction;
-	const c: Ctx = { db, options, now: d.now ?? Date.now(), stripe: d.stripe ?? null, transport: d.transport ?? null, actor: d.actor ?? null };
+	const c: Ctx = { db, options, now: d.now ?? Date.now(), stripe: d.stripe ?? null, transport: d.transport ?? null, actor: d.actor ?? null, settings: d.settings ?? null, envFallback: d.envFallback, stripeFactory: d.stripeFactory };
 	try {
 		if (i.type === "page_load") return await renderPage(c, i.page ?? "/");
 		if (i.type === "block_action" || i.type === "form_submit") {

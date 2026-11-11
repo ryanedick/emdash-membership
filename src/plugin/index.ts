@@ -17,11 +17,12 @@ import type { PluginOptions } from "./options.ts";
 export type { PluginOptions } from "./options.ts";
 
 export const PLUGIN_ID = "emdash-memberships";
-export const PLUGIN_VERSION = "0.3.0";
+export const PLUGIN_VERSION = "0.4.0";
 
 export const ADMIN_PAGES = [
 	{ path: "/", label: "Members", icon: "users", group: "Members" },
 	{ path: "/members", label: "All members", icon: "search", group: "Members" },
+	{ path: "/connections", label: "Connections", icon: "key", group: "Members" },
 	{ path: "/plans", label: "Plans & prices", icon: "layers", group: "Members" },
 	{ path: "/coupons", label: "Coupons", icon: "tag", group: "Members" },
 	{ path: "/revenue", label: "Revenue", icon: "chart", group: "Members" },

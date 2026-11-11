@@ -25,11 +25,27 @@ export interface AdminDeps {
 	transport?: EmailTransport | null;
 	/** Staff member using the admin, recorded in the audit trail */
 	actor?: string | null;
+	/** The plugin's EmDash settings (encrypted secrets); enables the Connections page */
+	settings?: PluginSettingsStore | null;
+	/** Environment for key fallbacks (default: the Worker's env) */
+	envFallback?: Record<string, unknown>;
+	/** Builds a Stripe client for a key (tests); default: the real SDK */
+	stripeFactory?: (key: string) => Stripe;
 	now?: number;
+}
+
+/** The slice of EmDash's plugin `ctx.settings` the admin uses. Secret fields are encrypted by EmDash. */
+export interface PluginSettingsStore {
+	get<T>(key: string): Promise<T | null>;
+	set(key: string, value: unknown): Promise<void>;
+	delete(key: string): Promise<boolean>;
 }
 export interface Ctx {
 	/** Who is acting (staff email or id), for the audit trail */
 	actor: string | null;
+	settings: PluginSettingsStore | null;
+	envFallback?: Record<string, unknown>;
+	stripeFactory?: (key: string) => Stripe;
 	db: Db;
 	options: PluginOptions;
 	now: number;
@@ -81,7 +97,7 @@ export const list = (v: unknown) =>
 		.map((s) => s.trim())
 		.filter(Boolean);
 export const stripeNotice = (c: Ctx): Block[] =>
-	c.stripe ? [] : [banner("Stripe isn't connected", `Set the ${c.options.stripeSecretEnv ?? "STRIPE_SECRET_KEY"} secret to manage prices, coupons and subscriptions here.`, "alert")];
+	c.stripe ? [] : [banner("Stripe isn't connected", "Add your Stripe key on Members → Connections to manage prices, coupons and subscriptions here.", "alert"), actions(nav("Open Connections", "/connections", "primary"))];
 
 export function billingOf(c: Ctx) {
 	if (!c.stripe) return null;

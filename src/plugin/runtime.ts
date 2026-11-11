@@ -18,6 +18,8 @@ import { listPlans, listPrices } from "../plans.ts";
 import { conversionReport, revenueReport } from "../revenue.ts";
 import type { EmailTransport } from "../transport.ts";
 import { type CloudflareSendEmailBinding, cloudflareEmailTransport } from "../transports/cloudflare.ts";
+import { getMembershipSecrets, SETTINGS_SCHEMA } from "../settings.ts";
+import { stripeClientFor } from "../stripe.ts";
 import { handleAdmin } from "./admin.ts";
 import { ADMIN_PAGES, ADMIN_WIDGETS, PLUGIN_ID, PLUGIN_VERSION } from "./index.ts";
 import type { PluginOptions } from "./options.ts";
@@ -39,19 +41,20 @@ async function database(options: PluginOptions): Promise<Db> {
 	return db;
 }
 
-let stripeClient: { key: string; client: Stripe } | null = null;
+/** Env with the configured Stripe variable name mapped onto the standard one. */
+async function fallbackEnv(options: PluginOptions): Promise<Record<string, unknown>> {
+	const env = await cloudflareEnv();
+	return options.stripeSecretEnv ? { ...env, STRIPE_SECRET_KEY: env[options.stripeSecretEnv] } : env;
+}
 
-/** A Stripe client from the configured secret, or null when it isn't set (or the `stripe` package isn't installed). */
-async function stripeFor(options: PluginOptions): Promise<Stripe | null> {
-	const key = (await cloudflareEnv())[options.stripeSecretEnv ?? "STRIPE_SECRET_KEY"];
-	if (typeof key !== "string" || !key) return null;
-	if (stripeClient?.key === key) return stripeClient.client;
+type SettingsCtx = { settings?: { get<T>(key: string): Promise<T | null> } };
+
+/** A Stripe client from the key saved in the admin (or the environment), or null when none is set. */
+async function stripeFor(options: PluginOptions, ctx: SettingsCtx): Promise<Stripe | null> {
+	const secrets = await getMembershipSecrets({ read: async (k) => (ctx.settings ? await ctx.settings.get(k).catch(() => null) : null), env: await fallbackEnv(options) });
+	if (!secrets.stripeSecretKey) return null;
 	try {
-		const { default: StripeCtor } = (await import("stripe" as string)) as { default: typeof Stripe };
-		// No apiVersion: the SDK pins the version its types were generated for.
-		const client = new StripeCtor(key, { httpClient: StripeCtor.createFetchHttpClient(), maxNetworkRetries: 2 });
-		stripeClient = { key, client };
-		return client;
+		return await stripeClientFor(secrets.stripeSecretKey);
 	} catch {
 		return null;
 	}
@@ -111,7 +114,7 @@ export function createPlugin(options: PluginOptions = {}) {
 		id: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		capabilities: [],
-		admin: { pages: ADMIN_PAGES, widgets: ADMIN_WIDGETS },
+		admin: { pages: ADMIN_PAGES, widgets: ADMIN_WIDGETS, settingsSchema: SETTINGS_SCHEMA },
 		hooks: {
 			// EmDash disables a plugin whose activate hook throws, so failures are only logged.
 			"plugin:activate": async (_event, ctx) => {
@@ -141,9 +144,9 @@ export function createPlugin(options: PluginOptions = {}) {
 			admin: {
 				permission,
 				handler: async (ctx) => {
-					const [db, stripe, transport] = await Promise.all([database(options), stripeFor(options), transportFor(options)]);
+					const [db, stripe, transport, env] = await Promise.all([database(options), stripeFor(options, ctx), transportFor(options), fallbackEnv(options)]);
 					const user = (ctx as { user?: { email?: string; id?: string } }).user;
-					return handleAdmin(db, ctx.input, options, { stripe, transport, actor: user?.email ?? user?.id ?? null });
+					return handleAdmin(db, ctx.input, options, { stripe, transport, actor: user?.email ?? user?.id ?? null, settings: ctx.settings, envFallback: env });
 				},
 			},
 			"mcp/stats": route(empty, async (db) => {

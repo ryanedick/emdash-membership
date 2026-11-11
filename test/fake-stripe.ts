@@ -203,6 +203,34 @@ export function fakeStripe(): FakeStripe & { client: Stripe } {
 				return structuredClone(s);
 			}),
 	});
+	const endpoints = new Map<string, Obj>();
+	self.endpoints = endpoints;
+	self.webhookEndpoints = {
+		create: async (p: Obj) =>
+			self.call("webhookEndpoints.create", [p], undefined, () => {
+				const ep = { id: self.id("we"), object: "webhook_endpoint", secret: `whsec_fake${self.seq}`, status: "enabled", ...p };
+				endpoints.set(ep.id, ep);
+				return ep;
+			}),
+		del: async (id: string) => self.call("webhookEndpoints.del", [id], undefined, () => (endpoints.delete(id), { id, deleted: true })),
+		list: (p: Obj) => {
+			self.calls.push({ method: "webhookEndpoints.list", args: [p] });
+			if (self.failNext === "webhookEndpoints.list") {
+				self.failNext = null;
+				return Object.assign(Promise.reject(new Error("permission denied")), {
+					async *[Symbol.asyncIterator]() {
+						throw new Error("permission denied");
+					},
+				});
+			}
+			const rows = [...endpoints.values()].map(({ secret: _s, ...rest }) => rest);
+			return Object.assign(Promise.resolve({ data: rows, has_more: false }), {
+				async *[Symbol.asyncIterator]() {
+					yield* rows;
+				},
+			});
+		},
+	};
 	return f as FakeStripe & { client: Stripe };
 }
 

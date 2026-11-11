@@ -212,3 +212,15 @@ export {
 } from "./events.ts";
 export { bulkGrant, csvCell, exportMembersCsv, type ImportOptions, type ImportReport, importMembersCsv, parseCsv } from "./transfer.ts";
 export { type AccountView, accountView, formatMoney, priceLabel, type PricingPlan, type PricingPrice, pricingTable } from "./views.ts";
+export {
+	clearSecretsCache,
+	ENV_FALLBACKS,
+	getMembershipSecrets,
+	maskSecret,
+	type MembershipSecrets,
+	PLUGIN_ID,
+	type SecretsOptions,
+	SETTINGS_SCHEMA,
+	type SettingKey,
+	stripeMode,
+} from "./settings.ts";

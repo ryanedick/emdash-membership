@@ -172,30 +172,27 @@ Their entitlements (the free plan's plus every held plan's) are cached per membe
 
 ## Stripe (optional)
 
-1. Set secrets: `wrangler secret put STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. A **restricted** key needs write access to Customers, Checkout Sessions, Customer Portal, Subscriptions, Products, Prices, Coupons and Promotion Codes, and read access to Invoices and Charges.
-2. Create prices: in the admin (**Plans & prices**: each plan becomes a Stripe Product, each price a Stripe Price with a lookup key), or import Stripe Prices you already have with lookup keys (**Import prices**).
-3. Wire it up:
+1. **Keys, in the admin.** Open **Members → Connections**, paste a Stripe secret key and press **Create webhook in Stripe**. The plugin registers the webhook endpoint with every event it handles and saves its signing secret. Both are stored encrypted by EmDash (with the site's `EMDASH_ENCRYPTION_KEY`) and are never shown again. Use a **restricted** key with write access to Customers, Checkout Sessions, Customer portal, Subscriptions, Products, Prices, Coupons, Promotion codes and Webhook Endpoints, and read access to Invoices, Charges and Payment Intents. **Test connection** checks it.
+
+   Prefer environment variables? `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` still work. A key saved in the admin takes over from them.
+2. **Prices:** in the admin (**Plans & prices**: each plan becomes a Stripe Product, each price a Stripe Price with a lookup key), or import Stripe Prices you already have (**Import prices**).
+3. **Wire it up.** `createBillingFromSettings` reads the keys from the admin (or the environment), and returns null until a key is set, so the routes answer "unavailable" instead of failing:
 
    ```ts
    // src/lib/billing.ts
    import { env } from "cloudflare:workers";
-   import { createBilling } from "emdash-memberships/stripe";
-   import Stripe from "stripe";
+   import { createBillingFromSettings } from "emdash-memberships/stripe";
    import { members } from "./members";
 
-   let stripe: Stripe | undefined;
-
    export const billing = members.billingRoutes({
-   	enabled: () => !!env.STRIPE_SECRET_KEY && !!env.STRIPE_WEBHOOK_SECRET,
-   	billing: () => {
-   		stripe ??= new Stripe(env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
-   		return createBilling({ db: env.DB, stripe, webhookSecret: env.STRIPE_WEBHOOK_SECRET });
-   	},
+   	billing: () => createBillingFromSettings({ db: env.DB }),
    });
    ```
 
+   (`createBilling({ db, stripe, webhookSecret })` is still there if you build the Stripe client yourself.)
+
 4. Routes: `export const POST = billing.webhookRoute` at `/api/stripe/webhook`, `billing.checkoutRoute` at `/api/billing/checkout`, `billing.portalRoute` at `/api/billing/portal`. The checkout form posts `offer` = a price's lookup key (or a key of `offers`, if you fix offers in code).
-5. In the Stripe Dashboard, add a webhook endpoint for `https://your-site/api/stripe/webhook` with the events in `BILLING_WEBHOOK_EVENTS` (12, including `customer.subscription.trial_will_end`). Locally: `stripe listen --forward-to localhost:4321/api/stripe/webhook`.
+5. The webhook endpoint is created from **Connections**. To do it by hand instead, add `https://your-site/api/stripe/webhook` in the Stripe Dashboard with the events in `BILLING_WEBHOOK_EVENTS` (12, including `customer.subscription.trial_will_end`) and save its signing secret on Connections. Until a signing secret is set, the webhook answers 503 so Stripe retries rather than dropping events. Locally: `stripe listen --forward-to localhost:4321/api/stripe/webhook`.
 
 How it behaves:
 
@@ -295,7 +292,7 @@ Mount the ones you use (each is one line, e.g. `export const POST = members.prof
 | `changePlanRoute`, `cancelRoute`, `resumeRoute` | `billing` | Switch price; the cancel flow; undo a cancellation or end a pause |
 | `giftCheckoutRoute`, `teamCheckoutRoute`, `teamSeatsRoute` | `billing` | Buy a gift; buy a team; change a team's seats |
 
-`membershipsAstro` also takes `onboarding: true` (send new members with unanswered required questions to `paths.onboarding`), `autoJoinTeams` (default on), and `verifyHuman: turnstileVerifier(() => env.TURNSTILE_SECRET_KEY)` to check Cloudflare Turnstile on sign-in.
+`membershipsAstro` also takes `onboarding: true` (send new members with unanswered required questions to `paths.onboarding`), `autoJoinTeams` (default on), and `verifyHuman: turnstileFromSettings()` to check Cloudflare Turnstile on sign-in with the keys saved on **Connections** (or `turnstileVerifier(() => env.TURNSTILE_SECRET_KEY)` for an environment variable). `getMembershipSecrets()` returns the Turnstile site key for your form.
 
 ## Profile questions
 
@@ -366,6 +363,7 @@ emdash({ plugins: [membershipsPlugin({ d1Binding: "DB" })] });
 
 It needs `emdash` and `zod` (both already in an EmDash site), and `stripe` for the pages that change Stripe. Pages:
 
+- **Connections**: Stripe and Turnstile keys, entered in write-only fields and stored encrypted; test the Stripe key; create the Stripe webhook in one click.
 - **Members**: totals, paid vs free, subscriptions, canceling and past-due counts, early members, comp-only access, MRR, new members per day. Also a dashboard widget.
 - **All members**: search by email, filter by paid/free or early-member badge, and give any address time on a plan.
 - **A member**: plans and entitlements and where they come from, subscriptions (change plan, cancel, resume), early access and grace period, a link to their Stripe customer, comp time (give or revoke), emails sent, sign out on every device, and erase. Erasing is refused while a subscription is live.
@@ -387,7 +385,7 @@ MCP tools: `members_stats`, `members_plans`, `members_find`, `members_get`, `mem
 | `d1Binding` | `"DB"` | D1 binding with the `mbr_` tables |
 | `permission` | `"users:manage"` | Who can open it. Admins only by default, since it shows personal and billing data |
 | `proStatuses` | active, trialing, past_due | Must match your billing config |
-| `stripeSecretEnv` | `"STRIPE_SECRET_KEY"` | Env var with the Stripe key. Without it the Stripe pages are read-only |
+| `stripeSecretEnv` | `"STRIPE_SECRET_KEY"` | Env var used when no Stripe key is saved on Connections |
 | `emailBinding` | `"EMAIL"` | Cloudflare `send_email` binding for lifecycle emails. `""` to send them yourself |
 | `cronSchedule` | every 5 minutes | Lifecycle emails, webhooks and expiring comp time |
 | `stripeDashboardUrl` | `https://dashboard.stripe.com` | Base for customer links; add `/test` in test mode |

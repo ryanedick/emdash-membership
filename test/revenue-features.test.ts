@@ -22,7 +22,7 @@ async function setup() {
 	const deps = { db, stripe: f.client, now: T0 };
 	await savePlan(db, { id: "pro", name: "Pro", entitlements: ["pro"] });
 	await savePlan(db, { id: "team", name: "Team", entitlements: ["pro", "seats"] });
-	const billing = createBilling({ db, stripe: f.client, webhookSecret: "", now: () => T0 });
+	const billing = createBilling({ db, stripe: f.client, webhookSecret: "whsec_test", now: () => T0 });
 	let evt = 0;
 	const send = (type: string, object: Record<string, unknown>) => billing.handleWebhook(JSON.stringify({ id: `evt_${++evt}`, type, data: { object } }), "valid");
 	const member = async (id: string, email = `${id}@example.com`) => {
