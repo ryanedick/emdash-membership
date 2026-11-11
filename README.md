@@ -1,12 +1,18 @@
 # emdash-memberships
 
-Member accounts for [EmDash](https://github.com/emdash-cms/emdash) sites on Cloudflare: passwordless magic-link sign-in, sessions, Stripe subscriptions and one-time purchases, and comp "Pro" time for rewards and giveaways.
+Member accounts for [EmDash](https://github.com/emdash-cms/emdash) sites on Cloudflare: passwordless magic-link sign-in, plans and entitlements, Stripe subscriptions and one-time purchases with trials and coupons, revenue reporting, lifecycle emails, comp time for rewards and giveaways, and a Members area in the EmDash admin.
 
 - **Sign-in by email link.** No passwords. Links are single-use, expire in 15 minutes, and are rate-limited per address and per IP.
 - **Free and Pro plans.** `Astro.locals.member.plan` tells every page what the visitor may see.
 - **Stripe, optional.** Checkout, the Customer Portal, and a webhook handler that turns payments, refunds and disputes into access.
 - **Comp time.** Give someone Pro for N days without Stripe, once per idempotency key, stacking end to end.
-- **Members admin.** An optional EmDash plugin adds a Members area to `/_emdash/admin`: stats and MRR, member search, each member's billing and comp history, give or revoke Pro time, sign out everywhere, erase, and early-member export. Plus MCP tools for agents.
+- **Plans and entitlements.** Any number of plans, each granting entitlements your pages check with `can(member, "archive")`.
+- **Members admin.** An optional EmDash plugin adds a Members area to `/_emdash/admin`: plans and prices synced to Stripe, coupons, revenue (MRR, churn, conversion), member management with plan changes and comp time, and lifecycle email settings. Plus MCP tools for agents.
+- **Lifecycle emails.** Welcome, failed payment, trial ending, cancellation, ended and win-back, plus gift and team emails, queued from webhooks and sent by a scheduled job.
+- **Access rules.** Gate collections, topics, entries or paths in the admin, with free windows, free flags and drip, and drop-in Astro components for the paywall, pricing table and account page.
+- **Gifts, teams, downloads and limited offers.** Sell gift memberships and per-seat team plans, protect files in R2, and cap an offer at N members or a date.
+- **Cancel flow.** Ask why, offer a coupon, a pause or a switch, and see why people leave.
+- **Events, webhooks, import/export.** Signed webhooks for every change, CSV import from other platforms with Stripe customer linking, CSV export, notes and an audit trail.
 - **Runs on D1.** Tables are created on first use. No migration step.
 
 These are site visitors (readers, subscribers). They're separate from EmDash staff users, who sign in to `/_emdash/admin`.
@@ -143,10 +149,31 @@ That's sign-in done. The rest is optional.
 
 The login form also treats a filled-in `website` field as a bot (honeypot) and pretends to succeed.
 
+## Plans and entitlements
+
+A **plan** grants **entitlements**: plain strings your pages check, like `archive` or `courses`. Two plans are built in: `free` (everyone gets its entitlements) and `pro` (grants `pro`). Add more in the admin (**Members → Plans & prices**) or in code with `savePlan`.
+
+```ts
+import { can } from "emdash-memberships";
+
+const member = Astro.locals.member; // plans and entitlements are loaded with the session
+if (can(member, "archive")) {
+	// show the full tip
+}
+```
+
+A member holds a plan while one of these is true:
+
+- a subscription to one of the plan's prices is active, trialing or past due;
+- they bought a one-time price that grants early access;
+- they've been given time on it (`grantProTime({ email, days, plan, key })`).
+
+Their entitlements (the free plan's plus every held plan's) are cached per member, so a page view stays one query. `member.plan` is still `"pro"` while any paid plan is held, so 0.2 code keeps working.
+
 ## Stripe (optional)
 
-1. In Stripe, create Prices with **lookup keys** (e.g. `pro_monthly`, `pro_annual`). Your code refers to lookup keys, so test and live mode share it.
-2. Set secrets: `wrangler secret put STRIPE_SECRET_KEY` (a restricted key is fine) and `STRIPE_WEBHOOK_SECRET`.
+1. Set secrets: `wrangler secret put STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. A **restricted** key needs write access to Customers, Checkout Sessions, Customer Portal, Subscriptions, Products, Prices, Coupons and Promotion Codes, and read access to Invoices and Charges.
+2. Create prices: in the admin (**Plans & prices**: each plan becomes a Stripe Product, each price a Stripe Price with a lookup key), or import Stripe Prices you already have with lookup keys (**Import prices**).
 3. Wire it up:
 
    ```ts
@@ -156,78 +183,216 @@ The login form also treats a filled-in `website` field as a bot (honeypot) and p
    import Stripe from "stripe";
    import { members } from "./members";
 
-   const OFFERS = {
-   	pro_monthly: { lookupKey: "pro_monthly", mode: "subscription" },
-   	pro_annual: { lookupKey: "pro_annual", mode: "subscription" },
-   } as const;
-
    let stripe: Stripe | undefined;
 
    export const billing = members.billingRoutes({
    	enabled: () => !!env.STRIPE_SECRET_KEY && !!env.STRIPE_WEBHOOK_SECRET,
    	billing: () => {
    		stripe ??= new Stripe(env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
-   		return createBilling({ db: env.DB, stripe, webhookSecret: env.STRIPE_WEBHOOK_SECRET, offers: OFFERS });
+   		return createBilling({ db: env.DB, stripe, webhookSecret: env.STRIPE_WEBHOOK_SECRET });
    	},
    });
    ```
 
-4. Routes: `export const POST = billing.webhookRoute` at `/api/stripe/webhook`, `billing.checkoutRoute` at `/api/billing/checkout` (form field `offer`), `billing.portalRoute` at `/api/billing/portal`.
-5. In the Stripe Dashboard, add a webhook endpoint for `https://your-site/api/stripe/webhook` with the events in `BILLING_WEBHOOK_EVENTS`. Locally: `stripe listen --forward-to localhost:4321/api/stripe/webhook`.
+4. Routes: `export const POST = billing.webhookRoute` at `/api/stripe/webhook`, `billing.checkoutRoute` at `/api/billing/checkout`, `billing.portalRoute` at `/api/billing/portal`. The checkout form posts `offer` = a price's lookup key (or a key of `offers`, if you fix offers in code).
+5. In the Stripe Dashboard, add a webhook endpoint for `https://your-site/api/stripe/webhook` with the events in `BILLING_WEBHOOK_EVENTS` (12, including `customer.subscription.trial_will_end`). Locally: `stripe listen --forward-to localhost:4321/api/stripe/webhook`.
 
 How it behaves:
 
 - Access is granted only from verified webhooks, never from the success page.
-- Subscription state is re-fetched from Stripe on each event, so out-of-order delivery can't leave a stale status. `active`, `trialing` and `past_due` count as Pro (`proStatuses` to change).
+- Subscription state is re-fetched from Stripe on each event, so out-of-order delivery can't leave a stale status. `active`, `trialing` and `past_due` count (`proStatuses` to change).
 - Events are processed once each (by event ID).
+- **Trials:** a price's trial days apply to first-time subscribers only.
+- **Coupons:** the promotion code field shows at checkout while any coupon from the admin is active (`allowPromotionCodes` to force it on or off).
+- **Plan changes:** `billing.changePlan(memberId, lookupKey)` moves a subscription to another price with proration; `cancelSubscription` (at period end, or now) and `resumeSubscription` end it or undo that. The admin has buttons for all three; the Customer Portal can do the same for members.
+- **Revenue:** each subscription's amount, quantity and recurring discount are stored with it, and every change of its MRR is logged (new, expansion, contraction, churn, reactivation). `revenueReport(db)` and `conversionReport(db)` power the admin's Revenue page.
 - A full refund or an opened dispute on a one-time purchase removes the access it gave. Disputes and early fraud warnings flag the member (`risk_flag`).
 - `billing.summary(memberId)` returns what an account page needs; `purchasable: (member) => [...]` limits which offers can be bought.
 
 ### One-time "early access" purchases
 
-An offer with `mode: "payment", grantsEarlyAccess: true` gives Pro with no end date and a permanent early-member badge. When you're ready to charge subscriptions, `startPaidLaunch(db, { graceDays: 14 })` gives every early member a grace period; `expireGracePeriods`, `dueNotices` and `markNoticeSent` run the rest from a scheduled job (launch email, reminder, "you're on Free now"). `earlyMemberCouponId` discounts their first subscription. `listEarlyMembers(db)` exports them.
+A one-time price marked "grants early access" (or an `offers` entry with `grantsEarlyAccess: true`) gives its plan with no end date and a permanent early-member badge. When you're ready to charge subscriptions, `startPaidLaunch(db, { graceDays: 14 })` gives every early member a grace period; `expireGracePeriods`, `dueNotices` and `markNoticeSent` run the rest from a scheduled job (launch email, reminder, "you're on Free now"). `earlyMemberCouponId` discounts their first subscription. `listEarlyMembers(db)` exports them.
+
+## Lifecycle emails
+
+Billing webhooks queue these, once each, and a scheduled job sends them:
+
+| Email | When |
+|---|---|
+| Welcome | A checkout completes |
+| Payment failed | An invoice payment fails (with Stripe's next retry date) |
+| Trial ending | Stripe's `trial_will_end`, 3 days before |
+| Cancellation scheduled | A subscription is set to cancel at period end |
+| Subscription ended | A subscription ends |
+| Win-back | N days after it ended (default 30), unless they're back; can offer a coupon code |
+| Gift bought / received | To the buyer with the code; to the recipient on the delivery date |
+| Gifted time ending | 5 days before a redeemed gift runs out, unless they've subscribed |
+| Team invitation | When a team admin invites someone |
+
+Set the From address, site URL and switches under **Members → Emails**, where every template can be edited and test-sent. With the EmDash plugin and a Cloudflare `send_email` binding named `EMAIL`, the plugin's cron sends them every 5 minutes. Without the plugin, call `processOutbox({ db, transport })` from your own scheduled job. Stripe can send receipts and card-expiry emails itself (Dashboard → Settings → Customer emails).
+
+## Access rules
+
+Decide what content needs in the admin (**Members → Access rules**) instead of in every page. A rule targets a collection, a taxonomy term, one entry, or a path pattern, and needs an entitlement or just a signed-in member. Exceptions open it up:
+
+- **Free window:** free for N hours after a date field (e.g. new posts are free for 72 hours).
+- **Free flag:** free whenever a boolean field is true (evergreen or lead-magnet posts).
+- **Drip:** entitled members see it N days after they joined.
+
+When access is refused the rule says what to show: a teaser (the first N blocks) with a paywall, or a redirect. The most specific rule wins (entry, term, collection, path), then priority.
+
+```astro
+---
+import Paywall from "emdash-memberships/components/Paywall.astro";
+import { paywallJsonLd, teaser } from "emdash-memberships";
+import { members } from "../../lib/members";
+
+const decision = await members.access(Astro, { collection: "tips", slug: entry.id, terms: ["category:prompting"], fields: entry.data });
+if (!decision.allowed && decision.view === "redirect") return Astro.redirect(decision.redirectTo!);
+const body = decision.allowed ? entry.data.body : teaser(entry.data.body, decision.teaserBlocks);
+const jsonLd = { "@context": "https://schema.org", "@type": "Article", ...paywallJsonLd(decision, ".paywalled") };
+---
+<div class="paywalled"><PortableText value={body} /></div>
+{!decision.allowed && <Paywall decision={decision} signedIn={!!Astro.locals.member} />}
+```
+
+Decisions are made on the server; gated content is never sent and hidden with CSS. `paywallJsonLd` marks the gated part for search engines, so a paywall isn't mistaken for cloaking.
+
+## Components
+
+Drop-in Astro components. They work without JavaScript, post to the routes below, and take their data from `pricingTable()` and `accountView()`. Style them with CSS variables (`--mbr-accent`, `--mbr-on-accent`, `--mbr-surface`, `--mbr-border`, `--mbr-muted`, `--mbr-radius`) or their `.mbr-*` classes.
+
+| Component | Shows |
+|---|---|
+| `Paywall.astro` | The locked message for an access decision (upgrade, sign in, or "unlocks on …" for drip) |
+| `PricingTable.astro` | Plans and prices from the admin, with trial, per-month, "N left" and team-seat forms |
+| `MemberAccount.astro` | A whole account page: plan, renewal, billing portal, switch plan, cancel/resume, profile, teams, downloads, gifts |
+| `CancelFlow.astro` | Why are you leaving, then the save offer for that reason |
+| `GiftForm.astro` | Buy a gift membership, and redeem a code |
+| `TeamManager.astro` | For team admins: seats, invite, join link, join domain, remove |
+
+```astro
+---
+import MemberAccount from "emdash-memberships/components/MemberAccount.astro";
+import { accountView } from "emdash-memberships";
+const view = await accountView(env.DB, Astro.locals.member, { billing: billingEnabled() ? billing() : null });
+---
+<MemberAccount view={view} />
+```
+
+## Routes
+
+Mount the ones you use (each is one line, e.g. `export const POST = members.profileRoute;`):
+
+| Route | From | Does |
+|---|---|---|
+| `loginRoute`, `verifyRoute`, `logoutRoute` | `members` | Sign-in by email link |
+| `profileRoute` | `members` | Saves profile answers (`onboarding=1` enforces required sign-up questions) |
+| `redeemGiftRoute` | `members` | Redeems a gift code for the signed-in member |
+| `joinTeamRoute`, `manageTeamRoute` | `members` | Join a team by link; team admins invite, remove, set the join domain, rotate the link |
+| `downloadRoute({ bucket })` | `members` | `GET /download/[id]`: streams a protected file from R2 |
+| `webhookRoute`, `checkoutRoute`, `portalRoute` | `billing` | Stripe webhook, checkout, Customer Portal |
+| `changePlanRoute`, `cancelRoute`, `resumeRoute` | `billing` | Switch price; the cancel flow; undo a cancellation or end a pause |
+| `giftCheckoutRoute`, `teamCheckoutRoute`, `teamSeatsRoute` | `billing` | Buy a gift; buy a team; change a team's seats |
+
+`membershipsAstro` also takes `onboarding: true` (send new members with unanswered required questions to `paths.onboarding`), `autoJoinTeams` (default on), and `verifyHuman: turnstileVerifier(() => env.TURNSTILE_SECRET_KEY)` to check Cloudflare Turnstile on sign-in.
+
+## Profile questions
+
+Define questions in the admin (**Member settings → Profile questions**): short or long text, one or several choices, a checkbox, or a link. Each can be required and asked at sign-up. Answers are stored per member, shown on their admin page, included in the CSV export, and sent with the `member.profile_updated` event, so a newsletter can segment on them (e.g. "readers who use Claude").
+
+## Cancel flow and pausing
+
+`cancelRoute` asks why the member is leaving. Each reason can carry a save offer, set under **Member settings → Cancel flow**:
+
+- `coupon CODE`: apply an active coupon to their subscription;
+- `pause N`: pause billing for N months (no charges and no access until it resumes);
+- `switch lookup_key`: move them to another recurring price (e.g. annual).
+
+Every attempt is recorded with its outcome. The settings page shows why people leave and how many stayed. `billing.pauseSubscription`, `unpauseSubscription` and `applyCoupon` are available on their own too.
+
+## Gifts
+
+Mark a one-time price as a gift with **gift days** (e.g. $90 for 365 days of Pro). `giftCheckoutRoute` takes an optional recipient email, name, message and delivery date. Once paid:
+
+- the buyer gets the code;
+- the recipient (if given) gets it on the delivery date;
+- redeeming gives that many days of the plan, stacked after any time they already have;
+- a reminder goes out five days before it ends, unless they've subscribed;
+- a full refund cancels the gift, or ends the time if it was redeemed.
+
+Staff can make free codes for giveaways under **Members → Gifts**.
+
+## Teams
+
+Mark a recurring price **per seat** to sell team plans. `teamCheckoutRoute` buys N seats and creates a team owned by the buyer, who is its first admin. Admins invite by email or share the join link, and people with an email at the team's **join domain** are seated when they sign in. Every seat holder gets the team's plan while the subscription is live. `teamSeatsRoute` changes the seat count, prorated. Staff can make free teams in the admin, e.g. for partners.
+
+## Downloads
+
+Files in an R2 bucket (prompt packs, templates, PDFs), each needing an entitlement and with an optional per-member limit. Add them under **Members → Downloads** by their key in the bucket, and mount `downloadRoute({ bucket: () => env.MEDIA })` at `src/pages/download/[id].ts`. Files never get a public URL. Every download is logged and counted.
+
+## Limited offers
+
+Any price can be capped at a number of members ("founding 100") and/or given an end date. Checkout refuses it once it's sold out or ended. `billing.offerAvailability(lookupKey)` and `PricingTable` show how many places are left.
+
+## Events and webhooks
+
+Everything that changes a member's standing is an event: `member.created`, `member.plans_changed`, `member.profile_updated`, `member.deleted`, `checkout.completed`, `subscription.updated`, `subscription.cancel_scheduled`, `subscription.ended`, `payment.failed`, `gift.purchased`, `gift.redeemed`, `team.created`, `team.member_joined`, `team.member_removed`, `download.fetched`.
+
+- `onMemberEvent((e) => …)` runs your code in the same Worker, e.g. tagging newsletter subscribers.
+- Webhooks (**Member settings → Webhooks**) post events as JSON to any https URL, for Zapier, Make, n8n or your own service. Each delivery is signed with `X-Membership-Signature: t=…,v1=…` (HMAC-SHA256 of `t.body`), and failed deliveries are retried for about a day. `verifyWebhookSignature(secret, body, header)` checks it on the receiving end.
+- Each member's admin page shows their event timeline, staff notes, and an audit trail of staff actions.
+
+## Import and export
+
+**Members → Import & export** takes a CSV with an email column. Columns are recognised by common names (name, plan, days, tier, status, complimentary, expiry, Stripe customer id, created date, and your profile question keys), so exports from most newsletter and membership tools work as they are. Run a dry run first.
+
+- Rows marked paid get comp time on the plan you choose.
+- Rows with a Stripe customer id are linked with `billing.linkCustomer`, which pulls in their existing subscription without charging them again.
+- Original join dates are kept.
+
+The same page exports every member, or only paid members, as CSV with plans, entitlements, billing state and profile answers, and can give time to a list of emails at once. In code: `importMembersCsv`, `exportMembersCsv`, `bulkGrant`.
 
 ## Members admin (EmDash plugin)
 
-Register the plugin to get a **Members** area in the EmDash admin. Sign-in and billing keep running from your site's routes; the plugin is the staff side.
+Register the plugin to get a **Members** area in the EmDash admin. Sign-in, checkout and the webhook keep running from your site's routes; the plugin is the staff side.
 
 ```js
 // astro.config.mjs
 import { membershipsPlugin } from "emdash-memberships/plugin";
 
-emdash({
-	plugins: [
-		membershipsPlugin({
-			d1Binding: "DB",
-			// Optional: show MRR (list price, before coupons). Keys are Stripe Price lookup keys.
-			planValues: {
-				pro_monthly: { amount: 900, interval: "month" },
-				pro_annual: { amount: 9000, interval: "year" },
-			},
-		}),
-	],
-});
+emdash({ plugins: [membershipsPlugin({ d1Binding: "DB" })] });
 ```
 
-It needs `emdash` and `zod` (both already in an EmDash site). Pages:
+It needs `emdash` and `zod` (both already in an EmDash site), and `stripe` for the pages that change Stripe. Pages:
 
-- **Members**: totals, Pro vs Free, paying subscriptions, canceling and past-due counts, early members, comp-only Pro, MRR, and new members per day. Also a dashboard widget.
-- **All members**: search by email, filter by plan or early-member badge, and give any address Pro time.
-- **A member**: plan and why they have it, subscriptions, early access and grace period, a link to their Stripe customer, comp time (give or revoke), sign out on every device, and erase. Erasing is refused while a subscription is live: cancel it in Stripe first.
+- **Members**: totals, paid vs free, subscriptions, canceling and past-due counts, early members, comp-only access, MRR, new members per day. Also a dashboard widget.
+- **All members**: search by email, filter by paid/free or early-member badge, and give any address time on a plan.
+- **A member**: plans and entitlements and where they come from, subscriptions (change plan, cancel, resume), early access and grace period, a link to their Stripe customer, comp time (give or revoke), emails sent, sign out on every device, and erase. Erasing is refused while a subscription is live.
+- **Plans & prices**: create plans and their entitlements, add monthly, yearly or one-time prices with trials, archive, sync to Stripe, import existing Stripe prices.
+- **Coupons**: percent or amount off, once / for N months / forever, redemption limits, expiry, first purchase only.
+- **Revenue**: MRR, ARR, average per subscription, a 12-month MRR chart, new / expansion / reactivation / contraction / churn, churn rates, free → paid and trial conversion.
+- **Access rules**, **Teams**, **Gifts**, **Downloads**: described above.
+- **Emails**: lifecycle email settings, templates, test sends and recent sends.
+- **Import & export**: CSV in and out, and giving time to a list of people.
 - **Early members**: everyone with the badge, with a CSV export.
+- **Member settings**: profile questions, the cancel flow and its report, webhooks.
 
-MCP tools: `members_stats`, `members_find`, `members_get`, `members_grant_pro`.
+A member's page adds their timeline, staff notes (with author), the audit trail, and a form to link a Stripe customer. Every successful staff action is recorded with who did it.
+
+MCP tools: `members_stats`, `members_plans`, `members_find`, `members_get`, `members_rules`, `members_check_access`, `members_events`, `members_grant_pro`. The same routes answer REST calls at `/_emdash/api/plugins/emdash-memberships/mcp/<name>` with an EmDash API token.
 
 | Option | Default | |
 |---|---|---|
 | `d1Binding` | `"DB"` | D1 binding with the `mbr_` tables |
 | `permission` | `"users:manage"` | Who can open it. Admins only by default, since it shows personal and billing data |
 | `proStatuses` | active, trialing, past_due | Must match your billing config |
-| `planValues` | none | Value per Price lookup key, for MRR. Omit to hide MRR |
-| `currency` | `"USD"` | For MRR |
+| `stripeSecretEnv` | `"STRIPE_SECRET_KEY"` | Env var with the Stripe key. Without it the Stripe pages are read-only |
+| `emailBinding` | `"EMAIL"` | Cloudflare `send_email` binding for lifecycle emails. `""` to send them yourself |
+| `cronSchedule` | every 5 minutes | Lifecycle emails, webhooks and expiring comp time |
 | `stripeDashboardUrl` | `https://dashboard.stripe.com` | Base for customer links; add `/test` in test mode |
 
-The same queries are exported for other back offices: `memberStats`, `listMembers`, `getMemberDetail`, `signOutEverywhere`, `deleteMember`.
+The same queries are exported for other back offices: `memberStats`, `listMembers`, `getMemberDetail`, `signOutEverywhere`, `deleteMember`, `revenueReport`, `conversionReport`, and the catalog functions in `emdash-memberships/stripe` (`createPrice`, `createCoupon`, `importStripePrices`…).
 
 ## Comp Pro time
 
@@ -238,17 +403,18 @@ await grantProTime(env.DB, { email: "reader@example.com", days: 30, key: "referr
 ```
 
 - The member is created on Free if they've never signed in, so a reward can arrive before their first visit.
-- `key` is an idempotency key: a retried call never grants twice. Grants stack end to end.
-- `revokeGrant`, `listGrants` and `compEndsAt` cover the rest. `expireGrants(db)` moves expired members back to Free unless a subscription or early access keeps them on Pro.
+- `key` is an idempotency key: a retried call never grants twice. Grants of the same plan stack end to end.
+- `plan` picks the plan (default `pro`, or the first paid plan), e.g. a week of `team` for a trial.
+- `revokeGrant`, `listGrants` and `compEndsAt` cover the rest. `expireGrants(db)` moves expired members back to Free unless a subscription or early access keeps them on a paid plan.
 
 ## Scheduled jobs
 
-Comp time and grace periods end on a timer, so run the expiry helpers from a cron trigger. With EmDash's Cloudflare worker entry:
+Comp time and grace periods end on a timer, and lifecycle emails go out from a queue. The EmDash plugin runs `expireGrants` and `processOutbox` itself every 5 minutes. Without the plugin, run them from a cron trigger. With EmDash's Cloudflare worker entry:
 
 ```ts
 // src/worker.ts
 import handler, { createScheduledHandler, PluginBridge } from "@emdash-cms/cloudflare/worker";
-import { expireGrants } from "emdash-memberships";
+import { cloudflareEmailTransport, expireGrants, processOutbox } from "emdash-memberships";
 
 export { PluginBridge };
 const emdashScheduled = createScheduledHandler();
@@ -258,13 +424,14 @@ export default {
 	async scheduled(controller, env, ctx) {
 		await emdashScheduled(controller, env, ctx);
 		ctx.waitUntil(expireGrants(env.DB));
+		ctx.waitUntil(processOutbox({ db: env.DB, transport: cloudflareEmailTransport(env.EMAIL) }));
 	},
 } satisfies ExportedHandler<Env>;
 ```
 
 ### Following plan changes
 
-Every plan change is logged. `pendingPlanChanges(db)` and `ackPlanChanges(db, seq)` let one consumer follow them, e.g. to tag paying readers in your newsletter tool.
+Every change between free and paid is logged. `pendingPlanChanges(db)` and `ackPlanChanges(db, seq)` let one consumer follow them, e.g. to tag paying readers in your newsletter tool.
 
 ## Email delivery with other providers
 
@@ -316,6 +483,24 @@ const session = await m.getSession(cookieValue); // each request
 ## Data
 
 All tables are prefixed `mbr_` and live in your site's D1 database next to EmDash's own. The schema migrates itself on first use and records its version in `mbr_meta`.
+
+| Table | Holds |
+|---|---|
+| `mbr_members`, `mbr_sessions`, `mbr_login_tokens` | Accounts, sessions, sign-in links |
+| `mbr_plans`, `mbr_prices`, `mbr_coupons` | The catalog (synced to Stripe) |
+| `mbr_member_access` | Each member's cached plans and entitlements |
+| `mbr_billing`, `mbr_subscriptions`, `mbr_subscription_terms`, `mbr_checkouts` | Stripe customers, subscriptions with amounts and MRR, checkouts |
+| `mbr_grants`, `mbr_grant_plans` | Comp time |
+| `mbr_mrr_events`, `mbr_plan_changes` | Revenue movements, free ↔ paid log |
+| `mbr_outbox`, `mbr_notices`, `mbr_settings` | Lifecycle emails, paid-launch notices, settings |
+| `mbr_stripe_events` | Processed webhook event IDs |
+| `mbr_access_rules` | Access rules |
+| `mbr_profile_fields`, `mbr_profile_values` | Profile questions and answers |
+| `mbr_cancellations` | Cancel-flow attempts and outcomes |
+| `mbr_gifts`, `mbr_teams`, `mbr_team_members` | Gifts, teams and seats |
+| `mbr_downloads`, `mbr_download_log` | Protected files and who fetched them |
+| `mbr_events`, `mbr_webhooks`, `mbr_webhook_deliveries` | Event log and outbound webhooks |
+| `mbr_notes`, `mbr_audit` | Staff notes and staff actions |
 
 ## Development
 

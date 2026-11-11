@@ -13,22 +13,23 @@
  *    Free now" emails, each sent at most once per member.
  */
 import { type Db, ensureSchema } from "./db.ts";
+import { emitEvent } from "./events.ts";
+import { cachedAccess, resolveAccess, storeAccess } from "./plans.ts";
+import { DEFAULT_PRO_STATUSES, statusList } from "./status.ts";
 
-export const DEFAULT_PRO_STATUSES = ["active", "trialing", "past_due"] as const;
+export { DEFAULT_PRO_STATUSES } from "./status.ts";
 const DAY = 24 * 60 * 60 * 1000;
 
-function statusList(statuses: readonly string[]) {
-	return statuses.map((s) => `'${s.replace(/'/g, "")}'`).join(", ");
-}
-
 /**
- * The one entitlement rule: Pro if early access is active (granted, not
- * revoked, grace not over), a subscription is in a Pro status, or a comp
- * grant (see ./grants.ts) covers this moment.
+ * The one entitlement rule: a member holds a paid plan while early access is
+ * active (granted, not revoked, grace not over), a subscription is in a Pro
+ * status, or a comp grant (see ./grants.ts) covers this moment. Which plan
+ * comes from the price or grant (see ./plans.ts). Stores the plans and
+ * entitlements, and returns "pro" when any paid plan is held, else "free".
  *
- * A change of plan is also appended to `mbr_plan_changes` in the same
- * transaction, so other systems (e.g. a newsletter tagging Pro readers) can
- * follow plan changes with `pendingPlanChanges()` / `ackPlanChanges()`.
+ * A change between free and pro is also appended to `mbr_plan_changes` in the
+ * same transaction, so other systems (e.g. a newsletter tagging Pro readers)
+ * can follow it with `pendingPlanChanges()` / `ackPlanChanges()`.
  */
 export async function recomputePlan(
 	db: Db,
@@ -36,19 +37,8 @@ export async function recomputePlan(
 	opts: { proStatuses?: readonly string[]; now?: number } = {},
 ): Promise<"free" | "pro"> {
 	const t = opts.now ?? Date.now();
-	const row = await db
-		.prepare(
-			`SELECT
-				EXISTS (SELECT 1 FROM mbr_billing b WHERE b.member_id = ?1 AND b.early_access_at IS NOT NULL
-					AND b.early_access_revoked_at IS NULL AND (b.grace_ends_at IS NULL OR b.grace_ends_at > ?2)) AS early,
-				EXISTS (SELECT 1 FROM mbr_subscriptions s WHERE s.member_id = ?1
-					AND s.status IN (${statusList(opts.proStatuses ?? DEFAULT_PRO_STATUSES)})) AS subscribed,
-				EXISTS (SELECT 1 FROM mbr_grants g WHERE g.member_id = ?1 AND g.revoked_at IS NULL
-					AND g.ends_at > ?2) AS granted`,
-		)
-		.bind(memberId, t)
-		.first<{ early: number; subscribed: number; granted: number }>();
-	const plan = row?.early || row?.subscribed || row?.granted ? "pro" : "free";
+	const [before, access] = await Promise.all([cachedAccess(db, memberId), resolveAccess(db, memberId, { ...opts, now: t })]);
+	const plan = access.paid ? "pro" : "free";
 	await db.batch([
 		db
 			.prepare(
@@ -57,7 +47,11 @@ export async function recomputePlan(
 			)
 			.bind(plan, t, memberId),
 		db.prepare(`UPDATE mbr_members SET plan = ? WHERE id = ?`).bind(plan, memberId),
+		storeAccess(db, memberId, access, t),
 	]);
+	if (before.plans.join(",") !== access.plans.join(",")) {
+		await emitEvent(db, "member.plans_changed", memberId, { before: before.plans, after: access.plans, entitlements: access.entitlements }, t);
+	}
 	return plan;
 }
 

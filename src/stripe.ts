@@ -1,6 +1,7 @@
 /**
- * Stripe billing for memberships: Checkout, the Customer Portal, and the
- * webhook handler that turns payments into entitlements.
+ * Stripe billing for memberships: Checkout, the Customer Portal, plan
+ * changes, and the webhook handler that turns payments into entitlements,
+ * revenue figures and lifecycle emails.
  *
  * Rules this module follows (from Stripe's integration guidance):
  * - Access is granted only from verified webhooks, never from the success page.
@@ -11,11 +12,21 @@
  * - No `payment_method_types`: payment methods come from the Dashboard.
  */
 import type Stripe from "stripe";
+import { hasActiveCoupons } from "./catalog.ts";
 import { type Db, ensureSchema } from "./db.ts";
+import { emitEvent } from "./events.ts";
+import { attachGiftCheckout, createPendingGift, getGift, markGiftPaid, refundGift } from "./gifts.ts";
+import { activateTeam, attachTeamCheckout, createPendingTeam, getTeam, refreshTeamAccess, seatsInUse, setTeamSeats } from "./teams.ts";
 import { recomputePlan as recomputePlanFor } from "./launch.ts";
+import { type EmailData, type EmailKind, enqueueEmail, getLifecycleSettings } from "./lifecycle.ts";
 import type { Member } from "./memberships.ts";
+import { getPlan, getPrice, type PlanPrice } from "./plans.ts";
+import { mrrMovement, mrrOf } from "./revenue.ts";
 
+export * from "./catalog.ts";
 export * from "./launch.ts";
+
+const DAY = 24 * 60 * 60 * 1000;
 
 export interface Offer {
 	/** Stripe Price `lookup_key`; the price ID is resolved at runtime */
@@ -25,23 +36,40 @@ export interface Offer {
 	grantsEarlyAccess?: boolean;
 	/** Dashboard label for this checkout flow (Checkout `integration_identifier`) */
 	integrationIdentifier?: string;
+	/** Free trial for first-time subscribers, in days */
+	trialDays?: number;
 }
 
 export interface BillingConfig<OfferKey extends string = string> {
 	db: Db;
 	stripe: Stripe;
 	webhookSecret: string;
-	offers: Record<OfferKey, Offer>;
+	/**
+	 * Offers fixed in code. Optional: any active price created in the admin
+	 * (see ./catalog) can be bought by its lookup key as well.
+	 */
+	offers?: Record<OfferKey, Offer>;
 	/** Coupon applied automatically to subscription checkouts for early members */
 	earlyMemberCouponId?: string;
+	/** Show the promotion code field at checkout. Default: when an active coupon exists (see ./catalog). */
+	allowPromotionCodes?: boolean;
 	/** Subscription statuses that count as Pro. Default: active, trialing, past_due */
 	proStatuses?: Stripe.Subscription.Status[];
+	/** Queue lifecycle emails (see ./lifecycle). Default true; they're only sent once settings are complete. */
+	lifecycleEmails?: boolean;
 	now?: () => number;
 }
 
 export type CheckoutResult =
 	| { ok: true; url: string }
-	| { ok: false; reason: "already_pro" | "already_subscribed" | "unknown_offer" | "price_missing" };
+	| {
+			ok: false;
+			reason: "already_pro" | "already_subscribed" | "unknown_offer" | "price_missing" | "sold_out" | "unavailable" | "invalid_recipient" | "invalid_delivery_date" | "invalid_seats";
+	  };
+
+export type ChangePlanResult =
+	| { ok: true; status: string }
+	| { ok: false; reason: "no_subscription" | "unknown_price" | "not_recurring" | "same_price" | "stripe_error"; error?: string };
 
 export interface BillingSummary {
 	hasCustomer: boolean;
@@ -51,10 +79,13 @@ export interface BillingSummary {
 	earlyAccessActive: boolean;
 	graceEndsAt: number | null;
 	subscription: {
+		id: string;
 		status: string;
 		lookupKey: string | null;
+		planId: string | null;
 		currentPeriodEnd: number | null;
 		cancelAtPeriodEnd: boolean;
+		trialEnd: number | null;
 	} | null;
 }
 
@@ -67,11 +98,25 @@ interface BillingRow {
 	grace_ends_at: number | null;
 }
 
+interface SubRow {
+	id: string;
+	member_id: string;
+	status: string;
+	price_id: string | null;
+	lookup_key: string | null;
+	current_period_end: number | null;
+	cancel_at_period_end: number;
+	updated_at: number;
+}
+
 const idOf = (v: string | { id: string } | null | undefined): string | null =>
 	v == null ? null : typeof v === "string" ? v : v.id;
 
+const ENDED = new Set(["canceled", "incomplete_expired"]);
+
 export function createBilling<OfferKey extends string>(config: BillingConfig<OfferKey>) {
 	const { db, stripe } = config;
+	const offers = (config.offers ?? {}) as Record<string, Offer>;
 	const now = config.now ?? Date.now;
 	const proStatuses = new Set<string>(config.proStatuses ?? ["active", "trialing", "past_due"]);
 	const priceCache = new Map<string, string>();
@@ -85,6 +130,21 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 		return id;
 	}
 
+	/** An offer from code, or an active admin-managed price with that lookup key. */
+	async function resolveOffer(key: string): Promise<(Offer & { price: PlanPrice | null }) | null> {
+		const fixed = offers[key];
+		const price = await getPrice(db, { lookupKey: fixed?.lookupKey ?? key });
+		if (fixed) return { ...fixed, trialDays: fixed.trialDays ?? price?.trialDays ?? 0, price };
+		if (!price?.active) return null;
+		return {
+			lookupKey: price.lookupKey,
+			mode: price.kind === "recurring" ? "subscription" : "payment",
+			grantsEarlyAccess: price.grantsEarlyAccess,
+			trialDays: price.trialDays,
+			price,
+		};
+	}
+
 	async function billingRow(memberId: string): Promise<BillingRow | null> {
 		return db.prepare(`SELECT * FROM mbr_billing WHERE member_id = ?`).bind(memberId).first<BillingRow>();
 	}
@@ -96,6 +156,10 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			.bind(customerId)
 			.first<{ member_id: string }>();
 		return row?.member_id ?? null;
+	}
+
+	async function emailOf(memberId: string): Promise<string | null> {
+		return (await db.prepare(`SELECT email FROM mbr_members WHERE id = ?`).bind(memberId).first<{ email: string }>())?.email ?? null;
 	}
 
 	async function customerFor(member: Member): Promise<string> {
@@ -124,9 +188,12 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 
 	async function activeSubscription(memberId: string) {
 		const { results } = await db
-			.prepare(`SELECT * FROM mbr_subscriptions WHERE member_id = ? ORDER BY updated_at DESC`)
+			.prepare(
+				`SELECT s.*, t.plan_id, t.trial_end FROM mbr_subscriptions s LEFT JOIN mbr_subscription_terms t ON t.subscription_id = s.id
+				 WHERE s.member_id = ? ORDER BY s.updated_at DESC`,
+			)
 			.bind(memberId)
-			.all<{ id: string; status: string; lookup_key: string | null; current_period_end: number | null; cancel_at_period_end: number }>();
+			.all<SubRow & { plan_id: string | null; trial_end: number | null }>();
 		return results.find((s) => proStatuses.has(s.status)) ?? results[0] ?? null;
 	}
 
@@ -135,33 +202,141 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 		return recomputePlanFor(db, memberId, { proStatuses: [...proStatuses], now: now() });
 	}
 
+	async function planName(priceIdOrNull: string | null, lookupKey: string | null): Promise<{ id: string | null; name: string }> {
+		const price = (priceIdOrNull && (await getPrice(db, { stripePriceId: priceIdOrNull }))) || (lookupKey && (await getPrice(db, { lookupKey }))) || null;
+		const plan = price ? await getPlan(db, price.planId) : null;
+		return { id: plan?.id ?? null, name: plan?.name ?? "Pro" };
+	}
+
+	async function queue(kind: EmailKind, memberId: string, dedupeKey: string, data: EmailData, sendAfter?: number) {
+		if (config.lifecycleEmails === false) return;
+		const to = await emailOf(memberId);
+		if (to) await enqueueEmail(db, { kind, to, memberId, dedupeKey, data, sendAfter }, now());
+	}
+
+	/** Recurring discount on a subscription, from its expanded discounts. "once" discounts don't count toward MRR. */
+	function recurringDiscount(sub: Stripe.Subscription): { pct: number | null; amount: number | null } {
+		for (const d of sub.discounts ?? []) {
+			if (typeof d === "string") continue;
+			const legacy = (d as unknown as { coupon?: Stripe.Coupon | string | null }).coupon;
+			const coupon = (typeof d.source?.coupon === "object" ? d.source.coupon : null) ?? (typeof legacy === "object" ? legacy : null);
+			if (!coupon || coupon.duration === "once") continue;
+			if (coupon.percent_off) return { pct: coupon.percent_off, amount: null };
+			if (coupon.amount_off) return { pct: null, amount: coupon.amount_off };
+		}
+		return { pct: null, amount: null };
+	}
+
 	async function syncSubscription(subscriptionId: string): Promise<string | null> {
-		const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ["items.data.price"] });
+		const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ["items.data.price", "discounts.source.coupon"] });
 		const memberId = await memberIdForCustomer(idOf(sub.customer));
 		if (!memberId) {
 			console.warn(`[memberships] subscription ${sub.id} belongs to an unknown customer; ignored`);
 			return null;
 		}
+		const t = now();
 		const item = sub.items.data[0];
-		await db
+		const price = item?.price;
+		// A paused subscription (pause_collection) stays "active" in Stripe; we record it as
+		// "paused": no charges, so no MRR, and no access until it resumes.
+		const status = sub.pause_collection ? "paused" : sub.status;
+		const before = await db
 			.prepare(
-				`INSERT INTO mbr_subscriptions (id, member_id, status, price_id, lookup_key, current_period_end, cancel_at_period_end, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-				 ON CONFLICT (id) DO UPDATE SET status = excluded.status, price_id = excluded.price_id,
-				   lookup_key = excluded.lookup_key, current_period_end = excluded.current_period_end,
-				   cancel_at_period_end = excluded.cancel_at_period_end, updated_at = excluded.updated_at`,
+				`SELECT s.status, s.cancel_at_period_end, t.mrr FROM mbr_subscriptions s
+				 LEFT JOIN mbr_subscription_terms t ON t.subscription_id = s.id WHERE s.id = ?`,
 			)
-			.bind(
-				sub.id,
-				memberId,
-				sub.status,
-				item?.price.id ?? null,
-				item?.price.lookup_key ?? null,
-				item?.current_period_end ? item.current_period_end * 1000 : null,
-				sub.cancel_at_period_end ? 1 : 0,
-				now(),
-			)
-			.run();
+			.bind(sub.id)
+			.first<{ status: string; cancel_at_period_end: number; mrr: number | null }>();
+		const plan = await planName(price?.id ?? null, price?.lookup_key ?? null);
+		const discount = recurringDiscount(sub);
+		const periodEnd = item?.current_period_end ? item.current_period_end * 1000 : null;
+		const terms = {
+			status,
+			amount: price?.unit_amount ?? null,
+			interval: price?.recurring?.interval ?? null,
+			intervalCount: price?.recurring?.interval_count ?? 1,
+			quantity: item?.quantity ?? 1,
+			discountPct: discount.pct,
+			discountAmount: discount.amount,
+		};
+		const mrr = mrrOf(terms);
+		const prevMrr = before?.mrr ?? 0;
+		const everEarned =
+			prevMrr > 0 ||
+			!!(await db.prepare(`SELECT 1 FROM mbr_mrr_events WHERE member_id = ? AND mrr_after > 0 LIMIT 1`).bind(memberId).first());
+		const movement = mrrMovement(prevMrr, mrr, everEarned);
+
+		await db.batch([
+			db
+				.prepare(
+					`INSERT INTO mbr_subscriptions (id, member_id, status, price_id, lookup_key, current_period_end, cancel_at_period_end, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					 ON CONFLICT (id) DO UPDATE SET status = excluded.status, price_id = excluded.price_id,
+					   lookup_key = excluded.lookup_key, current_period_end = excluded.current_period_end,
+					   cancel_at_period_end = excluded.cancel_at_period_end, updated_at = excluded.updated_at`,
+				)
+				.bind(sub.id, memberId, status, price?.id ?? null, price?.lookup_key ?? null, periodEnd, sub.cancel_at_period_end ? 1 : 0, t),
+			db
+				.prepare(
+					`INSERT INTO mbr_subscription_terms (subscription_id, plan_id, amount, currency, interval, interval_count, quantity,
+						discount_pct, discount_amount, mrr, trial_end, started_at, canceled_at, ended_at, updated_at)
+					 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+					 ON CONFLICT (subscription_id) DO UPDATE SET plan_id = excluded.plan_id, amount = excluded.amount,
+					   currency = excluded.currency, interval = excluded.interval, interval_count = excluded.interval_count,
+					   quantity = excluded.quantity, discount_pct = excluded.discount_pct, discount_amount = excluded.discount_amount,
+					   mrr = excluded.mrr, trial_end = excluded.trial_end, started_at = excluded.started_at,
+					   canceled_at = excluded.canceled_at, ended_at = excluded.ended_at, updated_at = excluded.updated_at`,
+				)
+				.bind(
+					sub.id,
+					plan.id,
+					terms.amount,
+					price?.currency ?? null,
+					terms.interval,
+					terms.intervalCount,
+					terms.quantity,
+					terms.discountPct,
+					terms.discountAmount,
+					mrr,
+					sub.trial_end ? sub.trial_end * 1000 : null,
+					sub.start_date ? sub.start_date * 1000 : null,
+					sub.canceled_at ? sub.canceled_at * 1000 : null,
+					sub.ended_at ? sub.ended_at * 1000 : null,
+					t,
+				),
+			...(movement
+				? [
+						db
+							.prepare(
+								`INSERT INTO mbr_mrr_events (member_id, subscription_id, at, currency, mrr_before, mrr_after, kind) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+							)
+							.bind(memberId, sub.id, t, price?.currency ?? "usd", prevMrr, mrr, movement),
+					]
+				: []),
+		]);
+
+		// Lifecycle emails and events on transitions only, so replays and unrelated updates send nothing.
+		const wasEnded = before ? ENDED.has(before.status) : false;
+		const info = { subscriptionId: sub.id, plan: plan.id, price: price?.lookup_key ?? null, status, mrr, currency: price?.currency ?? null };
+		if (!before || before.status !== status || (before.mrr ?? 0) !== mrr) await emitEvent(db, "subscription.updated", memberId, { ...info, previousStatus: before?.status ?? null }, t);
+		if (sub.cancel_at_period_end && !before?.cancel_at_period_end && !ENDED.has(sub.status)) {
+			await queue("cancel_scheduled", memberId, `cancel:${sub.id}:${periodEnd ?? 0}`, { planName: plan.name, date: periodEnd });
+			await emitEvent(db, "subscription.cancel_scheduled", memberId, { ...info, endsAt: periodEnd }, t);
+		}
+		if (ENDED.has(sub.status) && before && !wasEnded && before.status !== "incomplete") {
+			await emitEvent(db, "subscription.ended", memberId, info, t);
+			await queue("subscription_ended", memberId, `ended:${sub.id}`, { planName: plan.name });
+			const s = await getLifecycleSettings(db);
+			if (s.winBackDays > 0) {
+				await queue("win_back", memberId, `winback:${sub.id}`, { planName: plan.name }, t + s.winBackDays * DAY);
+			}
+		}
+		// A team's seats follow its subscription: keep the seat count and every seat holder's access in step.
+		const team = await getTeam(db, { subscriptionId: sub.id });
+		if (team) {
+			if (item?.quantity && item.quantity !== team.seats) await setTeamSeats(db, team.id, item.quantity, t);
+			if (!before || before.status !== status) await refreshTeamAccess(db, team.id, { proStatuses: [...proStatuses], now: t });
+		}
 		return memberId;
 	}
 
@@ -190,7 +365,21 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			.bind(t, idOf(session.payment_intent), session.id)
 			.run();
 
-		const offer = record ? config.offers[record.kind as OfferKey] : undefined;
+		// Gift and team checkouts carry their own record id in the kind.
+		if (record?.kind.startsWith("gift:")) {
+			await markGiftPaid(db, record.kind.slice(5), idOf(session.payment_intent), t);
+			return null;
+		}
+		if (record?.kind.startsWith("team:")) {
+			const subId = idOf(session.subscription);
+			if (subId) await syncSubscription(subId);
+			await db.prepare(`UPDATE mbr_teams SET subscription_id = ? WHERE id = ?`).bind(subId, record.kind.slice(5)).run();
+			await activateTeam(db, record.kind.slice(5), subId, { proStatuses: [...proStatuses], now: t });
+			await emitEvent(db, "checkout.completed", memberId, { sessionId: session.id, mode: session.mode, offer: "team", amount: session.amount_total ?? null, currency: session.currency ?? null }, t);
+			return memberId;
+		}
+
+		const offer = record ? await resolveOffer(record.kind) : null;
 		if (session.mode === "payment" && offer?.grantsEarlyAccess) {
 			await db
 				.prepare(
@@ -204,13 +393,21 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 		}
 		const subId = idOf(session.subscription);
 		if (subId) await syncSubscription(subId);
+		const plan = offer ? await planName(offer.price?.stripePriceId ?? null, offer.lookupKey) : { id: null, name: "Pro" };
+		await queue("welcome", memberId, `welcome:${session.id}`, { planName: plan.name });
+		await emitEvent(db, "checkout.completed", memberId, { sessionId: session.id, mode: session.mode, offer: record?.kind ?? null, plan: plan.id, amount: session.amount_total ?? null, currency: session.currency ?? null }, t);
 		return memberId;
 	}
 
 	async function revokeEarlyAccessForPayment(paymentIntentId: string | null, reason: string): Promise<string | null> {
 		const record = await checkoutBy("payment_intent_id", paymentIntentId);
 		if (!record) return null;
-		const offer = config.offers[record.kind as OfferKey];
+		if (record.kind.startsWith("gift:")) {
+			await refundGift(db, record.kind.slice(5), { proStatuses: [...proStatuses], now: now() });
+			const gift = await getGift(db, { id: record.kind.slice(5) });
+			return gift?.redeemedMemberId ?? null;
+		}
+		const offer = await resolveOffer(record.kind);
 		const t = now();
 		if (offer?.grantsEarlyAccess) {
 			await db
@@ -254,10 +451,41 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			case "customer.subscription.updated":
 			case "customer.subscription.deleted":
 				return syncSubscription(event.data.object.id);
+			case "customer.subscription.trial_will_end": {
+				const memberId = await syncSubscription(event.data.object.id);
+				const sub = event.data.object;
+				const item = sub.items?.data?.[0];
+				if (memberId && sub.trial_end && !sub.cancel_at_period_end) {
+					const plan = await planName(item?.price?.id ?? null, item?.price?.lookup_key ?? null);
+					await queue("trial_ending", memberId, `trial:${sub.id}:${sub.trial_end}`, {
+						planName: plan.name,
+						date: sub.trial_end * 1000,
+						amount: item?.price?.unit_amount != null ? item.price.unit_amount * (item.quantity ?? 1) : null,
+						currency: item?.price?.currency ?? null,
+					});
+				}
+				return memberId;
+			}
 			case "invoice.paid":
 			case "invoice.payment_failed": {
-				const subId = idOf(event.data.object.parent?.subscription_details?.subscription);
-				return subId ? syncSubscription(subId) : null;
+				const invoice = event.data.object;
+				const subId = idOf(invoice.parent?.subscription_details?.subscription);
+				const memberId = subId ? await syncSubscription(subId) : await memberIdForCustomer(idOf(invoice.customer));
+				if (event.type === "invoice.payment_failed" && memberId) {
+					// The subscription was synced just above, so its plan is on record.
+					const terms = subId
+						? await db.prepare(`SELECT plan_id FROM mbr_subscription_terms WHERE subscription_id = ?`).bind(subId).first<{ plan_id: string | null }>()
+						: null;
+					const name = (terms?.plan_id && (await getPlan(db, terms.plan_id))?.name) || "Pro";
+					await emitEvent(db, "payment.failed", memberId, { invoiceId: invoice.id, amount: invoice.amount_due, currency: invoice.currency, subscriptionId: subId }, now());
+					await queue("payment_failed", memberId, `payment_failed:${invoice.id}`, {
+						planName: name,
+						amount: invoice.amount_due,
+						currency: invoice.currency,
+						nextAttempt: invoice.next_payment_attempt ? invoice.next_payment_attempt * 1000 : null,
+					});
+				}
+				return memberId;
 			}
 			case "charge.refunded": {
 				const charge = event.data.object;
@@ -284,17 +512,71 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 		}
 	}
 
+	/** The member's live subscription and its first item, fresh from Stripe. */
+	async function liveSubscription(memberId: string) {
+		const row = await activeSubscription(memberId);
+		if (!row || !proStatuses.has(row.status)) return null;
+		const sub = await stripe.subscriptions.retrieve(row.id, { expand: ["items.data.price"] });
+		return { sub, item: sub.items.data[0] };
+	}
+
+	/** Capped offers: a member limit and/or an end date on a price. */
+	async function availability(p: PlanPrice): Promise<{ available: boolean; remaining: number | null; endsAt: number | null; reason: "ok" | "ended" | "sold_out" }> {
+		if (p.availableUntil && now() >= p.availableUntil) return { available: false, remaining: 0, endsAt: p.availableUntil, reason: "ended" };
+		if (!p.maxMembers) return { available: true, remaining: null, endsAt: p.availableUntil, reason: "ok" };
+		const r = await db
+			.prepare(
+				`SELECT COUNT(*) AS n FROM (
+					SELECT member_id FROM mbr_checkouts WHERE kind = ?1 AND status = 'complete'
+					UNION SELECT member_id FROM mbr_subscriptions WHERE lookup_key = ?1)`,
+			)
+			.bind(p.lookupKey)
+			.first<{ n: number }>();
+		const remaining = Math.max(0, p.maxMembers - Number(r?.n ?? 0));
+		return { available: remaining > 0, remaining, endsAt: p.availableUntil, reason: remaining > 0 ? "ok" : "sold_out" };
+	}
+
+	function successUrl(url: string) {
+		const s = new URL(url);
+		// Stripe fills in {CHECKOUT_SESSION_ID}; keep the braces unencoded.
+		return `${s.origin}${s.pathname}?session_id={CHECKOUT_SESSION_ID}`;
+	}
+
+	async function openSession(member: Member, params: Stripe.Checkout.SessionCreateParams) {
+		const session = await stripe.checkout.sessions.create({ customer: await customerFor(member), client_reference_id: member.id, ...params });
+		if (!session.url) throw new Error("Stripe returned a Checkout Session without a URL");
+		return session;
+	}
+
+	async function recordCheckout(sessionId: string, memberId: string, kind: string) {
+		await db.prepare(`INSERT INTO mbr_checkouts (session_id, member_id, kind, created_at) VALUES (?, ?, ?, ?)`).bind(sessionId, memberId, kind, now()).run();
+	}
+
+	async function afterChange(memberId: string, subId: string) {
+		await syncSubscription(subId);
+		await recomputePlan(memberId);
+	}
+
 	return {
-		/** Starts Stripe Checkout for an offer and returns the hosted page URL. */
+		/**
+		 * Starts Stripe Checkout and returns the hosted page URL. `offer` is a key
+		 * of `config.offers` or the lookup key of an active price from the admin.
+		 */
 		async startCheckout(input: {
 			member: Member;
-			offer: OfferKey;
+			offer: OfferKey | (string & {});
 			successUrl: string;
 			cancelUrl: string;
 		}): Promise<CheckoutResult> {
 			await ensureSchema(db);
-			const offer = config.offers[input.offer];
+			const offer = await resolveOffer(input.offer);
 			if (!offer) return { ok: false, reason: "unknown_offer" };
+			// Gift and team prices have their own checkouts.
+			if (offer.price && (offer.price.giftDays > 0 || offer.price.perSeat)) return { ok: false, reason: "unknown_offer" };
+			if (offer.price) {
+				const avail = await availability(offer.price);
+				if (!avail.available) return { ok: false, reason: avail.reason === "ended" ? "unavailable" : "sold_out" };
+			}
 
 			const b = await billingRow(input.member.id);
 			if (offer.mode === "payment" && offer.grantsEarlyAccess && earlyAccessActive(b)) {
@@ -303,7 +585,7 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			const sub = await activeSubscription(input.member.id);
 			if (sub && proStatuses.has(sub.status)) return { ok: false, reason: "already_subscribed" };
 
-			const price = await priceId(offer.lookupKey);
+			const price = offer.price?.stripePriceId ?? (await priceId(offer.lookupKey));
 			if (!price) return { ok: false, reason: "price_missing" };
 			const customer = await customerFor(input.member);
 
@@ -319,11 +601,17 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 				...(offer.integrationIdentifier && { integration_identifier: offer.integrationIdentifier }),
 			};
 			if (offer.mode === "payment") params.invoice_creation = { enabled: true };
+			// Trials are for first-time subscribers only.
+			if (offer.mode === "subscription" && (offer.trialDays ?? 0) > 0 && !sub) {
+				params.subscription_data = { trial_period_days: offer.trialDays };
+			}
 			// The early-member discount is for their first subscription, started before
 			// their grace period ends. Cancel and come back later, and regular prices apply.
 			const inGrace = b?.grace_ends_at == null || now() < b.grace_ends_at;
 			if (offer.mode === "subscription" && config.earlyMemberCouponId && b?.early_member && !sub && inGrace) {
 				params.discounts = [{ coupon: config.earlyMemberCouponId }];
+			} else if (config.allowPromotionCodes ?? (await hasActiveCoupons(db, now()))) {
+				params.allow_promotion_codes = true;
 			}
 
 			const session = await stripe.checkout.sessions.create(params);
@@ -335,6 +623,115 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			return { ok: true, url: session.url };
 		},
 
+		/** Whether a capped price can still be bought, and how many places are left. */
+		async offerAvailability(lookupKey: string) {
+			await ensureSchema(db);
+			const p = await getPrice(db, { lookupKey });
+			return p ? availability(p) : { available: false, remaining: 0, endsAt: null, reason: "ended" as const };
+		},
+
+		/**
+		 * Buys a gift: a gift price (one-time, with gift days) paid by `member`,
+		 * for `recipientEmail` (optional; without it the buyer gets the code to pass on).
+		 */
+		async startGiftCheckout(input: {
+			member: Member;
+			lookupKey: string;
+			recipientEmail?: string | null;
+			recipientName?: string | null;
+			message?: string | null;
+			deliverAt?: number | null;
+			successUrl: string;
+			cancelUrl: string;
+		}): Promise<CheckoutResult> {
+			await ensureSchema(db);
+			const pending = await createPendingGift(db, { buyer: input.member, ...input, now: now() });
+			if (!pending.ok) return { ok: false, reason: pending.reason === "not_a_gift_price" ? "unknown_offer" : pending.reason };
+			const price = await getPrice(db, { lookupKey: input.lookupKey });
+			const priceIdValue = price?.stripePriceId ?? (await priceId(input.lookupKey));
+			if (!priceIdValue) return { ok: false, reason: "price_missing" };
+			const session = await openSession(input.member, {
+				mode: "payment",
+				line_items: [{ price: priceIdValue, quantity: 1 }],
+				invoice_creation: { enabled: true },
+				success_url: successUrl(input.successUrl),
+				cancel_url: input.cancelUrl,
+			});
+			await attachGiftCheckout(db, pending.gift.id, session.id);
+			await recordCheckout(session.id, input.member.id, `gift:${pending.gift.id}`);
+			return { ok: true, url: session.url! };
+		},
+
+		/** Buys a team: a per-seat recurring price for `seats` seats, owned by `member`. */
+		async startTeamCheckout(input: { member: Member; lookupKey: string; seats: number; teamName: string; successUrl: string; cancelUrl: string }): Promise<CheckoutResult> {
+			await ensureSchema(db);
+			const price = await getPrice(db, { lookupKey: input.lookupKey });
+			if (!price?.active || !price.perSeat || price.kind !== "recurring") return { ok: false, reason: "unknown_offer" };
+			const seats = Math.floor(input.seats);
+			if (!(seats >= 1 && seats <= 1000)) return { ok: false, reason: "invalid_seats" };
+			const priceIdValue = price.stripePriceId ?? (await priceId(price.lookupKey));
+			if (!priceIdValue) return { ok: false, reason: "price_missing" };
+			const team = await createPendingTeam(db, { owner: input.member, planId: price.planId, seats, name: input.teamName, now: now() });
+			const promo = config.allowPromotionCodes ?? (await hasActiveCoupons(db, now()));
+			const session = await openSession(input.member, {
+				mode: "subscription",
+				line_items: [{ price: priceIdValue, quantity: seats }],
+				success_url: successUrl(input.successUrl),
+				cancel_url: input.cancelUrl,
+				...(promo && { allow_promotion_codes: true }),
+			});
+			await attachTeamCheckout(db, team.id, session.id);
+			await recordCheckout(session.id, input.member.id, `team:${team.id}`);
+			return { ok: true, url: session.url! };
+		},
+
+		/** Changes a team's seat count in Stripe (prorated). Can't go below the seats in use. */
+		async updateTeamSeats(teamId: string, seats: number): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const team = await getTeam(db, { id: teamId });
+			if (!team?.subscriptionId) return { ok: false, reason: "no_subscription" };
+			const n = Math.floor(seats);
+			if (!(n >= 1 && n <= 1000) || n < (await seatsInUse(db, teamId))) return { ok: false, reason: "stripe_error", error: "Choose at least as many seats as are in use" };
+			try {
+				const sub = await stripe.subscriptions.retrieve(team.subscriptionId, { expand: ["items.data.price"] });
+				const item = sub.items.data[0];
+				const updated = await stripe.subscriptions.update(sub.id, { items: [{ id: item.id, quantity: n }], proration_behavior: "create_prorations" });
+				await setTeamSeats(db, teamId, n, now());
+				await afterChange(team.ownerMemberId, sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/**
+		 * Links a Stripe customer to a member and pulls in their subscriptions, e.g.
+		 * after importing members who were already paying elsewhere. Nobody is charged.
+		 */
+		async linkCustomer(memberId: string, customerId: string): Promise<{ ok: true; subscriptions: number } | { ok: false; error: string }> {
+			await ensureSchema(db);
+			const owner = await memberIdForCustomer(customerId);
+			if (owner && owner !== memberId) return { ok: false, error: "That customer belongs to another member" };
+			await db
+				.prepare(
+					`INSERT INTO mbr_billing (member_id, stripe_customer_id, updated_at) VALUES (?, ?, ?)
+					 ON CONFLICT (member_id) DO UPDATE SET stripe_customer_id = excluded.stripe_customer_id, updated_at = excluded.updated_at`,
+				)
+				.bind(memberId, customerId, now())
+				.run();
+			let n = 0;
+			try {
+				for await (const s of stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 })) {
+					await syncSubscription(s.id);
+					n++;
+				}
+			} catch (err) {
+				return { ok: false, error: String((err as Error)?.message ?? err) };
+			}
+			await recomputePlan(memberId);
+			return { ok: true, subscriptions: n };
+		},
+
 		/** Customer Portal: plan changes, cancellation, cards, invoices. */
 		async portalUrl(member: Member, returnUrl: string): Promise<string | null> {
 			await ensureSchema(db);
@@ -342,6 +739,120 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			if (!customer) return null;
 			const session = await stripe.billingPortal.sessions.create({ customer, return_url: returnUrl });
 			return session.url;
+		},
+
+		/**
+		 * Moves the member's subscription to another recurring price (another plan,
+		 * or monthly ↔ annual). Stripe prorates by default; access updates now.
+		 */
+		async changePlan(memberId: string, lookupKey: string, opts: { prorate?: boolean } = {}): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const target = await getPrice(db, { lookupKey });
+			const targetId = target?.stripePriceId ?? (target ? await priceId(target.lookupKey) : null);
+			if (!target || !target.active || !targetId) return { ok: false, reason: "unknown_price" };
+			if (target.kind !== "recurring") return { ok: false, reason: "not_recurring" };
+			const live = await liveSubscription(memberId);
+			if (!live?.item) return { ok: false, reason: "no_subscription" };
+			if (live.item.price.id === targetId) return { ok: false, reason: "same_price" };
+			try {
+				const updated = await stripe.subscriptions.update(live.sub.id, {
+					items: [{ id: live.item.id, price: targetId }],
+					proration_behavior: opts.prorate === false ? "none" : "create_prorations",
+				});
+				await afterChange(memberId, live.sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/** Cancels at the end of the period (default) or right away. */
+		async cancelSubscription(memberId: string, opts: { atPeriodEnd?: boolean } = {}): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const live = await liveSubscription(memberId);
+			if (!live) return { ok: false, reason: "no_subscription" };
+			try {
+				const updated =
+					opts.atPeriodEnd === false
+						? await stripe.subscriptions.cancel(live.sub.id)
+						: await stripe.subscriptions.update(live.sub.id, { cancel_at_period_end: true });
+				await afterChange(memberId, live.sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/**
+		 * Pauses billing for `months` (Stripe `pause_collection`, invoices voided).
+		 * Paused members have no access until it resumes, automatically or via `unpauseSubscription`.
+		 */
+		async pauseSubscription(memberId: string, opts: { months: number }): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const live = await liveSubscription(memberId);
+			if (!live) return { ok: false, reason: "no_subscription" };
+			const months = Math.min(12, Math.max(1, Math.floor(opts.months)));
+			const resumes = new Date(now());
+			resumes.setUTCMonth(resumes.getUTCMonth() + months);
+			try {
+				const updated = await stripe.subscriptions.update(live.sub.id, {
+					pause_collection: { behavior: "void", resumes_at: Math.floor(resumes.getTime() / 1000) },
+				});
+				await afterChange(memberId, live.sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/** Ends a pause now. */
+		async unpauseSubscription(memberId: string): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const row = await db
+				.prepare(`SELECT id FROM mbr_subscriptions WHERE member_id = ? AND status = 'paused' ORDER BY updated_at DESC LIMIT 1`)
+				.bind(memberId)
+				.first<{ id: string }>();
+			if (!row) return { ok: false, reason: "no_subscription" };
+			try {
+				const updated = await stripe.subscriptions.update(row.id, { pause_collection: "" });
+				await afterChange(memberId, row.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/** Applies an admin-created coupon (by code) to the member's live subscription, e.g. as a save offer. */
+		async applyCoupon(memberId: string, code: string): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const coupon = await db
+				.prepare(`SELECT stripe_coupon_id FROM mbr_coupons WHERE code = ? AND active = 1 AND (expires_at IS NULL OR expires_at > ?)`)
+				.bind(code.trim().toUpperCase(), now())
+				.first<{ stripe_coupon_id: string | null }>();
+			if (!coupon?.stripe_coupon_id) return { ok: false, reason: "unknown_price", error: "Unknown or inactive coupon" };
+			const live = await liveSubscription(memberId);
+			if (!live) return { ok: false, reason: "no_subscription" };
+			try {
+				const updated = await stripe.subscriptions.update(live.sub.id, { discounts: [{ coupon: coupon.stripe_coupon_id }] });
+				await afterChange(memberId, live.sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
+		},
+
+		/** Undoes a cancellation scheduled for the end of the period. */
+		async resumeSubscription(memberId: string): Promise<ChangePlanResult> {
+			await ensureSchema(db);
+			const live = await liveSubscription(memberId);
+			if (!live) return { ok: false, reason: "no_subscription" };
+			try {
+				const updated = await stripe.subscriptions.update(live.sub.id, { cancel_at_period_end: false });
+				await afterChange(memberId, live.sub.id);
+				return { ok: true, status: updated.status };
+			} catch (err) {
+				return { ok: false, reason: "stripe_error", error: String((err as Error)?.message ?? err) };
+			}
 		},
 
 		async summary(memberId: string): Promise<BillingSummary> {
@@ -355,10 +866,13 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 				graceEndsAt: b?.grace_ends_at ?? null,
 				subscription: sub
 					? {
+							id: sub.id,
 							status: sub.status,
 							lookupKey: sub.lookup_key,
+							planId: sub.plan_id,
 							currentPeriodEnd: sub.current_period_end,
 							cancelAtPeriodEnd: !!sub.cancel_at_period_end,
+							trialEnd: sub.trial_end,
 						}
 					: null,
 			};
@@ -398,6 +912,14 @@ export function createBilling<OfferKey extends string>(config: BillingConfig<Off
 			return { status: 200, body: "ok" };
 		},
 
+		/** Re-reads one subscription from Stripe (e.g. after a manual change in the Dashboard). */
+		async syncSubscription(subscriptionId: string): Promise<string | null> {
+			await ensureSchema(db);
+			const memberId = await syncSubscription(subscriptionId);
+			if (memberId) await recomputePlan(memberId);
+			return memberId;
+		},
+
 		recomputePlan,
 	};
 }
@@ -412,6 +934,7 @@ export const BILLING_WEBHOOK_EVENTS = [
 	"customer.subscription.created",
 	"customer.subscription.updated",
 	"customer.subscription.deleted",
+	"customer.subscription.trial_will_end",
 	"invoice.paid",
 	"invoice.payment_failed",
 	"charge.refunded",

@@ -1,0 +1,72 @@
+---
+/**
+ * The cancel flow page body. Step one asks why; if that reason has a save
+ * offer, step two shows it (accept, or cancel anyway). Posts to `cancelRoute`.
+ *
+ *   import CancelFlow from "emdash-memberships/components/CancelFlow.astro";
+ *   import { getCancelFlow, offerFor, describeOffer } from "emdash-memberships";
+ *   const flow = await getCancelFlow(env.DB);
+ *   const reason = Astro.url.searchParams.get("offer");
+ *   const offer = reason ? await offerFor(env.DB, reason) : null;
+ *   <CancelFlow flow={flow} offerReason={reason} offerText={offer && describeOffer(offer)} />
+ */
+import type { CancelFlow } from "emdash-memberships";
+
+interface Props {
+	flow: CancelFlow;
+	/** Set on step two: the reason that has an offer (the `offer` query parameter) */
+	offerReason?: string | null;
+	offerText?: string | null;
+	action?: string;
+	accountPath?: string;
+	class?: string;
+}
+
+const { flow, offerReason, offerText, action = "/api/billing/cancel", accountPath = "/account", class: className = "" } = Astro.props;
+const comment = Astro.url.searchParams.get("comment") ?? "";
+const error = Astro.url.searchParams.get("error");
+---
+
+<div class={`mbr-cancel ${className}`}>
+	{error && <p class="mbr-cancel__error" role="alert">That didn't work ({error.replace(/_/g, " ")}).</p>}
+	{offerReason && offerText ? (
+		<form method="post" action={action} class="mbr-cancel__offer">
+			<input type="hidden" name="reason" value={offerReason} />
+			<input type="hidden" name="comment" value={comment} />
+			<p class="mbr-cancel__title">Before you go</p>
+			<p>{offerText}</p>
+			<div class="mbr-cancel__row">
+				<button class="mbr-button" type="submit" name="decision" value="accept">Yes, do that</button>
+				<button class="mbr-button mbr-button--quiet" type="submit" name="decision" value="decline">Cancel anyway</button>
+			</div>
+		</form>
+	) : (
+		<form method="post" action={action} class="mbr-cancel__reasons">
+			<p class="mbr-cancel__title">Why are you canceling?</p>
+			{flow.reasons.map((r, i) => (
+				<label class="mbr-cancel__reason"><input type="radio" name="reason" value={r.id} required checked={i === 0} /> {r.label}</label>
+			))}
+			{flow.askComment && <label>Anything we could do better? (optional)<textarea name="comment" maxlength="2000" rows="3" /></label>}
+			<div class="mbr-cancel__row">
+				<button class="mbr-button mbr-button--quiet" type="submit">Continue</button>
+				<button class="mbr-button" type="submit" name="decision" value="keep" formnovalidate>Never mind, keep my plan</button>
+			</div>
+			<p><a class="mbr-link" href={accountPath}>Back to my account</a></p>
+		</form>
+	)}
+</div>
+
+<style>
+	.mbr-cancel { max-width: 34rem; }
+	.mbr-cancel form { display: grid; gap: 0.75rem; padding: 1.25rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: var(--mbr-radius, 12px); background: var(--mbr-surface, #fff); }
+	.mbr-cancel__title { margin: 0; font-weight: 600; font-size: 1.15rem; }
+	.mbr-cancel__reason { display: flex; gap: 0.5rem; align-items: center; }
+	.mbr-cancel label { display: grid; gap: 0.25rem; }
+	.mbr-cancel__reason { display: flex !important; }
+	.mbr-cancel textarea { padding: 0.45rem 0.6rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: 8px; font: inherit; }
+	.mbr-cancel__row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+	.mbr-cancel__error { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-error-bg, #fef2f2); }
+	.mbr-button { display: inline-block; padding: 0.55rem 1.1rem; border: 0; border-radius: var(--mbr-radius, 999px); background: var(--mbr-accent, #111827); color: var(--mbr-on-accent, #fff); font: inherit; font-weight: 600; cursor: pointer; }
+	.mbr-button--quiet { background: transparent; color: inherit; border: 1px solid var(--mbr-border, #e5e7eb); }
+	.mbr-link { color: inherit; }
+</style>

@@ -29,6 +29,12 @@ import {
 	safeNextPath,
 } from "./memberships.ts";
 import type { Billing } from "./stripe.ts";
+import { type DownloadBucket, fetchDownload } from "./downloads.ts";
+import { redeemGift } from "./gifts.ts";
+import { needsOnboarding, saveProfile, listProfileFields } from "./profile.ts";
+import { cancelStep } from "./retention.ts";
+import { type AccessDecision, checkAccess, type ContentContext } from "./rules.ts";
+import { autoJoinTeams, getTeam, inviteToTeam, isTeamAdmin, joinTeam, removeFromTeam, rotateTeamLink, setJoinDomain } from "./teams.ts";
 
 type Lazy<T> = T | (() => T);
 const resolve = <T>(v: Lazy<T>): T => (typeof v === "function" ? (v as () => T)() : v);
@@ -74,7 +80,17 @@ export interface MembershipsAstroConfig {
 		account?: string;
 		/** Page Stripe returns to after payment. Default `/billing/success`. */
 		billingSuccess?: string;
+		/** Onboarding page for required sign-up questions. Default `/account/profile`. */
+		onboarding?: string;
+		/** Cancel-flow page (shows reasons and offers). Default `/account/cancel`. */
+		cancel?: string;
+		/** Team page. Default `/account/team`. */
+		team?: string;
 	};
+	/** After sign-in, send members who still owe required sign-up answers to `paths.onboarding`. Default false. */
+	onboarding?: boolean;
+	/** After sign-in, seat members on teams whose join domain matches their email. Default true. */
+	autoJoinTeams?: boolean;
 	/** Extra options for `createMemberships` (link TTL, session length, rate limits…). */
 	options?: Omit<MembershipsConfig, "db" | "sender">;
 }
@@ -89,6 +105,30 @@ export interface BillingRoutesConfig<OfferKey extends string = string> {
 }
 
 type Ctx = Pick<APIContext, "request" | "url" | "cookies" | "locals" | "redirect">;
+
+/**
+ * A `verifyHuman` check for Cloudflare Turnstile: put the widget in your
+ * sign-in form, then `membershipsAstro({ verifyHuman: turnstileVerifier(() => env.TURNSTILE_SECRET_KEY), … })`.
+ * With no secret set it lets everyone through (so local development works).
+ */
+export function turnstileVerifier(secret: Lazy<string | undefined>, opts: { fetch?: typeof fetch } = {}) {
+	return async (form: FormData, ip: string | null): Promise<boolean> => {
+		const key = resolve(secret);
+		if (!key) return true;
+		const token = String(form.get("cf-turnstile-response") ?? "");
+		if (!token) return false;
+		const body = new FormData();
+		body.set("secret", key);
+		body.set("response", token);
+		if (ip) body.set("remoteip", ip);
+		try {
+			const res = await (opts.fetch ?? fetch)("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body });
+			return ((await res.json()) as { success?: boolean }).success === true;
+		} catch {
+			return false;
+		}
+	};
+}
 
 function localsOf(ctx: Pick<APIContext, "locals">): { member?: Member } {
 	return ctx.locals as { member?: Member };
@@ -106,7 +146,15 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		pricing: "/pricing",
 		account: "/account",
 		billingSuccess: "/billing/success",
+		onboarding: "/account/profile",
+		cancel: "/account/cancel",
+		team: "/account/team",
 		...config.paths,
+	};
+	const db = () => resolve(config.db);
+	const redirectBack = (ctx: Ctx, fallback: string, params: Record<string, string>, form?: FormData | null) => {
+		const next = safeNextPath(String(form?.get("next") ?? "")) ?? fallback;
+		return ctx.redirect(withParams(next, params), 303);
 	};
 
 	function memberships(sender?: LoginEmailSender): Memberships {
@@ -197,6 +245,10 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		const result = await memberships().consumeLoginLink(token, { userAgent: request.headers.get("user-agent") });
 		if (!result.ok) return redirect(withParams(paths.login, { error: "expired" }), 303);
 		setSessionCookie(cookies, url, result.session.token, result.session.expiresAt);
+		if (config.autoJoinTeams !== false) await autoJoinTeams(db(), result.member).catch((err) => console.error("[memberships] team auto-join failed", err));
+		if (config.onboarding && (await needsOnboarding(db(), result.member.id))) {
+			return redirect(withParams(paths.onboarding, result.next ? { next: result.next } : {}), 303);
+		}
 		return redirect(result.next ?? paths.afterLogin, 303);
 	};
 
@@ -217,6 +269,109 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		const token = Astro.url.searchParams.get("token") ?? "";
 		const link = await memberships().peekLoginLink(token);
 		return link ? { email: link.email, token } : null;
+	}
+
+	/**
+	 * For page frontmatter: decides access to an entry under the admin's access
+	 * rules. Pass what the page knows about the content.
+	 *
+	 *   const decision = await members.access(Astro, { collection: "tips", slug, fields: entry.data });
+	 */
+	async function access(ctx: Pick<APIContext, "locals">, content: ContentContext): Promise<AccessDecision> {
+		return checkAccess(db(), localsOf(ctx).member, content);
+	}
+
+	const signedIn = (ctx: Ctx, back: string) => {
+		const member = localsOf(ctx).member;
+		return member ? { member, redirect: null } : { member: null, redirect: ctx.redirect(withParams(paths.login, { next: back }), 303) };
+	};
+
+	/** POST: profile answers (field keys as form names; repeat a name for multi-select). `next` to return somewhere. */
+	const profileRoute: APIRoute = async (ctx: Ctx) => {
+		const { member, redirect } = signedIn(ctx, paths.onboarding);
+		if (!member) return redirect!;
+		const form = await ctx.request.formData().catch(() => null);
+		const fields = await listProfileFields(db());
+		const input: Record<string, unknown> = {};
+		for (const f of fields) {
+			if (f.type === "multiselect") input[f.key] = form?.getAll(f.key).map(String) ?? [];
+			else if (f.type === "checkbox") input[f.key] = form?.get(f.key) === "on" || form?.get(f.key) === "true";
+			else if (form?.has(f.key)) input[f.key] = String(form.get(f.key));
+		}
+		const onboarding = form?.get("onboarding") === "1";
+		const r = await saveProfile(db(), member.id, input, { requireAll: onboarding, signupOnly: onboarding });
+		if (!r.ok) return ctx.redirect(withParams(onboarding ? paths.onboarding : paths.account, { error: "missing", fields: r.missing.join(",") }), 303);
+		return redirectBack(ctx, onboarding ? paths.afterLogin : paths.account, { saved: "profile" }, form);
+	};
+
+	/** POST: form field `code`. Redeems a gift for the signed-in member. */
+	const redeemGiftRoute: APIRoute = async (ctx: Ctx) => {
+		const form = await ctx.request.formData().catch(() => null);
+		const code = String(form?.get("code") ?? "").trim();
+		const { member, redirect } = signedIn(ctx, `/gift/redeem?code=${encodeURIComponent(code)}`);
+		if (!member) return redirect!;
+		const r = await redeemGift(db(), code, member);
+		return r.ok ? ctx.redirect(withParams(paths.account, { gift: "redeemed" }), 303) : redirectBack(ctx, "/gift/redeem", { error: r.reason, code }, form);
+	};
+
+	/** POST: form field `token` (the team's join link token). Seats the signed-in member. */
+	const joinTeamRoute: APIRoute = async (ctx: Ctx) => {
+		const form = await ctx.request.formData().catch(() => null);
+		const token = String(form?.get("token") ?? "");
+		const { member, redirect } = signedIn(ctx, `/team/join?token=${encodeURIComponent(token)}`);
+		if (!member) return redirect!;
+		const r = await joinTeam(db(), token, member);
+		return r.ok ? ctx.redirect(withParams(paths.account, { team: "joined" }), 303) : ctx.redirect(withParams("/team/join", { token, error: r.reason }), 303);
+	};
+
+	/**
+	 * POST: team admin actions. Fields: `team`, `action` = invite (`email`) |
+	 * remove (`email`) | domain (`domain`, blank to clear) | rotate-link.
+	 */
+	const manageTeamRoute: APIRoute = async (ctx: Ctx) => {
+		const form = await ctx.request.formData().catch(() => null);
+		const teamId = String(form?.get("team") ?? "");
+		const { member, redirect } = signedIn(ctx, paths.team);
+		if (!member) return redirect!;
+		if (!(await isTeamAdmin(db(), teamId, member.id))) return ctx.redirect(withParams(paths.team, { error: "not_admin" }), 303);
+		const action = String(form?.get("action") ?? "");
+		const email = String(form?.get("email") ?? "");
+		let error: string | null = null;
+		if (action === "invite") {
+			const r = await inviteToTeam(db(), teamId, email);
+			if (!r.ok) error = r.reason;
+		} else if (action === "remove") {
+			if (!(await removeFromTeam(db(), teamId, email))) error = "cant_remove";
+		} else if (action === "domain") {
+			if (!(await setJoinDomain(db(), teamId, String(form?.get("domain") ?? "") || null))) error = "invalid_domain";
+		} else if (action === "rotate-link") await rotateTeamLink(db(), teamId);
+		else error = "unknown_action";
+		return ctx.redirect(withParams(paths.team, error ? { team: teamId, error } : { team: teamId, saved: action }), 303);
+	};
+
+	/**
+	 * GET route for protected downloads, e.g. `src/pages/download/[id].ts`:
+	 *   export const GET = members.downloadRoute({ bucket: () => env.MEDIA });
+	 */
+	function downloadRoute(opts: { bucket: Lazy<DownloadBucket>; param?: string }): APIRoute {
+		return async (ctx) => {
+			const id = String(ctx.params[opts.param ?? "id"] ?? "");
+			const member = localsOf(ctx).member;
+			if (!member) return ctx.redirect(withParams(paths.login, { next: ctx.url.pathname }), 303);
+			const r = await fetchDownload(db(), resolve(opts.bucket), { id, member });
+			if (!r.ok) {
+				const status = r.reason === "not_found" || r.reason === "missing_file" ? 404 : 403;
+				return new Response(r.reason === "limit" ? "Download limit reached" : r.reason === "entitlement" ? "Your plan doesn't include this download" : "Not found", { status });
+			}
+			return new Response(r.body, {
+				headers: {
+					"Content-Type": r.contentType,
+					"Content-Disposition": `attachment; filename="${r.download.filename.replace(/"/g, "")}"`,
+					"Cache-Control": "private, no-store",
+					...(r.size ? { "Content-Length": String(r.size) } : {}),
+				},
+			});
+		};
 	}
 
 	/** Stripe routes: webhook, checkout and Customer Portal. */
@@ -272,7 +427,97 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 			return ctx.redirect(portal ?? paths.account, 303);
 		};
 
-		return { webhookRoute, checkoutRoute, portalRoute };
+		const requireBilling = (ctx: Ctx, back: string) => {
+			const { member, redirect } = signedIn(ctx, back);
+			if (!member) return { member: null, billing: null, response: redirect! };
+			if (!enabled()) return { member, billing: null, response: ctx.redirect(withParams(back, { error: "billing_unavailable" }), 303) };
+			return { member, billing: billing(), response: null };
+		};
+
+		/** POST, form field `price` (a recurring price's lookup key). Moves the member's subscription. */
+		const changePlanRoute: APIRoute = async (ctx: Ctx) => {
+			const form = await ctx.request.formData().catch(() => null);
+			const { member, billing: b2, response } = requireBilling(ctx, paths.account);
+			if (response) return response;
+			const r = await b2!.changePlan(member!.id, String(form?.get("price") ?? ""));
+			return ctx.redirect(withParams(paths.account, r.ok ? { saved: "plan" } : { error: r.reason }), 303);
+		};
+
+		/**
+		 * POST, the cancel flow. Fields: `reason`, optional `comment`, and on the
+		 * second step `decision` = accept | decline | keep. When the reason has a save
+		 * offer, the first post redirects to `paths.cancel` with `offer=<reason>`.
+		 */
+		const cancelRoute: APIRoute = async (ctx: Ctx) => {
+			const form = await ctx.request.formData().catch(() => null);
+			const { member, billing: b2, response } = requireBilling(ctx, paths.cancel);
+			if (response) return response;
+			const reason = String(form?.get("reason") ?? "");
+			const comment = String(form?.get("comment") ?? "") || null;
+			const decision = String(form?.get("decision") ?? "") as "accept" | "decline" | "keep" | "";
+			const r = await cancelStep(db(), b2!, { memberId: member!.id, reason, comment, decision: decision || undefined });
+			if (!r.ok) return ctx.redirect(withParams(paths.cancel, { error: r.reason }), 303);
+			if (r.outcome === "offer") return ctx.redirect(withParams(paths.cancel, { offer: reason, ...(comment ? { comment } : {}) }), 303);
+			return ctx.redirect(withParams(paths.account, { cancel: r.outcome }), 303);
+		};
+
+		/** POST. Undoes a cancellation scheduled for the period end, or ends a pause. */
+		const resumeRoute: APIRoute = async (ctx: Ctx) => {
+			const { member, billing: b2, response } = requireBilling(ctx, paths.account);
+			if (response) return response;
+			const r = await b2!.resumeSubscription(member!.id);
+			const r2 = r.ok ? r : await b2!.unpauseSubscription(member!.id);
+			return ctx.redirect(withParams(paths.account, r2.ok ? { saved: "resumed" } : { error: r2.reason }), 303);
+		};
+
+		/** POST: `price` (a gift price), optional `recipient_email`, `recipient_name`, `message`, `deliver_on` (YYYY-MM-DD). */
+		const giftCheckoutRoute: APIRoute = async (ctx: Ctx) => {
+			const form = await ctx.request.formData().catch(() => null);
+			const { member, billing: b2, response } = requireBilling(ctx, "/gift");
+			if (response) return response;
+			const on = String(form?.get("deliver_on") ?? "");
+			const deliverAt = on ? Date.parse(`${on}T09:00:00Z`) : null;
+			const r = await b2!.startGiftCheckout({
+				member: member!,
+				lookupKey: String(form?.get("price") ?? ""),
+				recipientEmail: String(form?.get("recipient_email") ?? "") || null,
+				recipientName: String(form?.get("recipient_name") ?? "") || null,
+				message: String(form?.get("message") ?? "") || null,
+				deliverAt: Number.isFinite(deliverAt) ? deliverAt : null,
+				successUrl: new URL(paths.billingSuccess, ctx.url).toString(),
+				cancelUrl: new URL(withParams("/gift", { checkout: "canceled" }), ctx.url).toString(),
+			});
+			return r.ok ? ctx.redirect(r.url, 303) : ctx.redirect(withParams("/gift", { error: r.reason }), 303);
+		};
+
+		/** POST: `price` (a per-seat price), `seats`, `team_name`. */
+		const teamCheckoutRoute: APIRoute = async (ctx: Ctx) => {
+			const form = await ctx.request.formData().catch(() => null);
+			const { member, billing: b2, response } = requireBilling(ctx, paths.pricing);
+			if (response) return response;
+			const r = await b2!.startTeamCheckout({
+				member: member!,
+				lookupKey: String(form?.get("price") ?? ""),
+				seats: Number(form?.get("seats") ?? 0),
+				teamName: String(form?.get("team_name") ?? ""),
+				successUrl: new URL(paths.billingSuccess, ctx.url).toString(),
+				cancelUrl: new URL(withParams(paths.pricing, { checkout: "canceled" }), ctx.url).toString(),
+			});
+			return r.ok ? ctx.redirect(r.url, 303) : ctx.redirect(withParams(paths.pricing, { error: r.reason }), 303);
+		};
+
+		/** POST: `team`, `seats`. Team admins change the seat count (prorated). */
+		const teamSeatsRoute: APIRoute = async (ctx: Ctx) => {
+			const form = await ctx.request.formData().catch(() => null);
+			const { member, billing: b2, response } = requireBilling(ctx, paths.team);
+			if (response) return response;
+			const teamId = String(form?.get("team") ?? "");
+			if (!(await isTeamAdmin(db(), teamId, member!.id)) || !(await getTeam(db(), { id: teamId }))) return ctx.redirect(withParams(paths.team, { error: "not_admin" }), 303);
+			const r = await b2!.updateTeamSeats(teamId, Number(form?.get("seats") ?? 0));
+			return ctx.redirect(withParams(paths.team, r.ok ? { team: teamId, saved: "seats" } : { team: teamId, error: r.error ?? r.reason }), 303);
+		};
+
+		return { webhookRoute, checkoutRoute, portalRoute, changePlanRoute, cancelRoute, resumeRoute, giftCheckoutRoute, teamCheckoutRoute, teamSeatsRoute };
 	}
 
 	return {
@@ -283,6 +528,12 @@ export function membershipsAstro(config: MembershipsAstroConfig) {
 		verifyRoute,
 		logoutRoute,
 		peekLoginLink,
+		access,
+		profileRoute,
+		redeemGiftRoute,
+		joinTeamRoute,
+		manageTeamRoute,
+		downloadRoute,
 		billingRoutes,
 		setSessionCookie,
 		clearSessionCookie,

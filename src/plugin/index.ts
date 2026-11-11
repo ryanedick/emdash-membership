@@ -17,12 +17,22 @@ import type { PluginOptions } from "./options.ts";
 export type { PluginOptions } from "./options.ts";
 
 export const PLUGIN_ID = "emdash-memberships";
-export const PLUGIN_VERSION = "0.2.0";
+export const PLUGIN_VERSION = "0.3.0";
 
 export const ADMIN_PAGES = [
 	{ path: "/", label: "Members", icon: "users", group: "Members" },
 	{ path: "/members", label: "All members", icon: "search", group: "Members" },
+	{ path: "/plans", label: "Plans & prices", icon: "layers", group: "Members" },
+	{ path: "/coupons", label: "Coupons", icon: "tag", group: "Members" },
+	{ path: "/revenue", label: "Revenue", icon: "chart", group: "Members" },
+	{ path: "/access", label: "Access rules", icon: "lock", group: "Members" },
+	{ path: "/teams", label: "Teams", icon: "users", group: "Members" },
+	{ path: "/gifts", label: "Gifts", icon: "gift", group: "Members" },
+	{ path: "/downloads", label: "Downloads", icon: "download", group: "Members" },
+	{ path: "/emails", label: "Emails", icon: "mail", group: "Members" },
+	{ path: "/import", label: "Import & export", icon: "upload", group: "Members" },
 	{ path: "/early", label: "Early members", icon: "star", group: "Members" },
+	{ path: "/settings", label: "Member settings", icon: "settings", group: "Members" },
 ];
 
 export const ADMIN_WIDGETS = [{ id: "members-overview", title: "Members", size: "half" as const }];

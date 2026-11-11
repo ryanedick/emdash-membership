@@ -1,0 +1,115 @@
+---
+/**
+ * Plans and prices from the admin, with buy buttons that post to your checkout route.
+ *
+ *   import PricingTable from "emdash-memberships/components/PricingTable.astro";
+ *   import { pricingTable } from "emdash-memberships";
+ *   const plans = await pricingTable(env.DB, { member: Astro.locals.member, billing: billing.enabled ? billing() : null });
+ *   <PricingTable plans={plans} signedIn={!!Astro.locals.member} />
+ *
+ * Gift and per-seat prices are left out unless `showGifts` / `showTeams` is set.
+ * Style with --mbr-accent, --mbr-border, --mbr-radius, or the .mbr-pricing classes.
+ */
+import type { PricingPlan } from "emdash-memberships";
+
+interface Props {
+	plans: PricingPlan[];
+	signedIn: boolean;
+	checkoutPath?: string;
+	teamCheckoutPath?: string;
+	loginPath?: string;
+	/** Monthly, yearly or one-time prices only (e.g. from a toggle) */
+	interval?: "month" | "year" | "one_time";
+	showGifts?: boolean;
+	showTeams?: boolean;
+	/** Bullet points per plan id */
+	features?: Record<string, string[]>;
+	buttonLabel?: string;
+	class?: string;
+}
+
+const {
+	plans,
+	signedIn,
+	checkoutPath = "/api/billing/checkout",
+	teamCheckoutPath = "/api/billing/team-checkout",
+	loginPath = "/login",
+	interval,
+	showGifts = false,
+	showTeams = false,
+	features = {},
+	buttonLabel = "Choose",
+	class: className = "",
+} = Astro.props;
+
+const shown = plans.map((plan) => ({
+	...plan,
+	prices: plan.prices.filter(
+		(p) =>
+			(showGifts || !p.giftDays) &&
+			(showTeams || !p.perSeat) &&
+			(!interval || (interval === "one_time" ? p.kind === "one_time" : p.interval === interval)),
+	),
+}));
+const login = `${loginPath}?next=${encodeURIComponent(Astro.url.pathname)}`;
+---
+
+<div class={`mbr-pricing ${className}`}>
+	{shown.map((plan) => (
+		<section class={`mbr-pricing__plan${plan.current ? " is-current" : ""}`}>
+			<h3 class="mbr-pricing__name">{plan.name}</h3>
+			{plan.description && <p class="mbr-pricing__desc">{plan.description}</p>}
+			{features[plan.id]?.length ? <ul class="mbr-pricing__features">{features[plan.id].map((f) => <li>{f}</li>)}</ul> : null}
+			{!plan.paid ? (
+				<p class="mbr-pricing__price">Free</p>
+			) : (
+				plan.prices.map((p) => (
+					<div class="mbr-pricing__price-row">
+						<p class="mbr-pricing__price">
+							{p.label}
+							{p.perMonthLabel && <span class="mbr-pricing__sub"> ({p.perMonthLabel})</span>}
+							{p.trialDays > 0 && <span class="mbr-pricing__sub"> · {p.trialDays}-day free trial</span>}
+							{p.remaining !== null && p.available && <span class="mbr-pricing__sub"> · {p.remaining} left</span>}
+						</p>
+						{plan.current ? (
+							<span class="mbr-pricing__badge">Your plan</span>
+						) : !p.available ? (
+							<span class="mbr-pricing__badge">Sold out</span>
+						) : !signedIn ? (
+							<a class="mbr-button" href={login}>Sign in to choose</a>
+						) : p.perSeat ? (
+							<form method="post" action={teamCheckoutPath} class="mbr-pricing__team">
+								<input type="hidden" name="price" value={p.lookupKey} />
+								<label>Team name <input name="team_name" required maxlength="80" /></label>
+								<label>Seats <input name="seats" type="number" min="1" max="1000" value="5" required /></label>
+								<button class="mbr-button" type="submit">{buttonLabel}</button>
+							</form>
+						) : (
+							<form method="post" action={checkoutPath}>
+								<input type="hidden" name="offer" value={p.lookupKey} />
+								<button class="mbr-button" type="submit">{buttonLabel}</button>
+							</form>
+						)}
+					</div>
+				))
+			)}
+		</section>
+	))}
+</div>
+
+<style>
+	.mbr-pricing { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+	.mbr-pricing__plan { padding: 1.25rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: var(--mbr-radius, 12px); background: var(--mbr-surface, #fff); }
+	.mbr-pricing__plan.is-current { border-color: var(--mbr-accent, #111827); }
+	.mbr-pricing__name { margin: 0 0 0.25rem; font-size: 1.2rem; }
+	.mbr-pricing__desc { margin: 0 0 0.75rem; color: var(--mbr-muted, #57534e); }
+	.mbr-pricing__features { margin: 0 0 1rem; padding-left: 1.1rem; }
+	.mbr-pricing__price-row { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.75rem; }
+	.mbr-pricing__price { margin: 0; font-weight: 600; }
+	.mbr-pricing__sub { font-weight: 400; color: var(--mbr-muted, #57534e); font-size: 0.9em; }
+	.mbr-pricing__badge { font-size: 0.85rem; color: var(--mbr-muted, #57534e); }
+	.mbr-pricing__team { display: grid; gap: 0.5rem; width: 100%; }
+	.mbr-pricing__team label { display: grid; gap: 0.25rem; font-size: 0.9rem; }
+	.mbr-pricing input { padding: 0.45rem 0.6rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: 8px; font: inherit; }
+	.mbr-button { display: inline-block; padding: 0.55rem 1.1rem; border: 0; border-radius: var(--mbr-radius, 999px); background: var(--mbr-accent, #111827); color: var(--mbr-on-accent, #fff); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+</style>

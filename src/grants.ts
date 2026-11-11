@@ -14,7 +14,9 @@
  *   from a scheduled job.
  */
 import { type Db, ensureSchema } from "./db.ts";
+import { emitEvent } from "./events.ts";
 import { DEFAULT_PRO_STATUSES, recomputePlan } from "./launch.ts";
+import { fallbackPaidPlan, getPlan } from "./plans.ts";
 import { normalizeEmail } from "./memberships.ts";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -28,6 +30,8 @@ export interface ProGrant {
 	endsAt: number;
 	revokedAt: number | null;
 	createdAt: number;
+	/** Plan granted; null for grants made before 0.3 (they grant the fallback paid plan) */
+	planId: string | null;
 }
 
 export interface GrantProInput {
@@ -38,13 +42,15 @@ export interface GrantProInput {
 	key: string;
 	/** Shown in admin/exports, e.g. "Referral reward: 3 referrals". */
 	reason?: string;
+	/** Plan to grant (see ./plans.ts). Default: "pro", or the first paid plan. Grants of one plan stack. */
+	plan?: string;
 	proStatuses?: readonly string[];
 	now?: number;
 }
 
 export type GrantProResult =
 	| { ok: true; created: boolean; grant: ProGrant; plan: "free" | "pro" }
-	| { ok: false; reason: "invalid_email" | "invalid_days" };
+	| { ok: false; reason: "invalid_email" | "invalid_days" | "invalid_plan" };
 
 interface GrantRow {
 	id: string;
@@ -55,6 +61,7 @@ interface GrantRow {
 	ends_at: number;
 	revoked_at: number | null;
 	created_at: number;
+	plan_id: string | null;
 }
 
 function toGrant(r: GrantRow): ProGrant {
@@ -67,11 +74,12 @@ function toGrant(r: GrantRow): ProGrant {
 		endsAt: r.ends_at,
 		revokedAt: r.revoked_at,
 		createdAt: r.created_at,
+		planId: r.plan_id ?? null,
 	};
 }
 
 async function grantByKey(db: Db, key: string): Promise<ProGrant | null> {
-	const r = await db.prepare(`SELECT * FROM mbr_grants WHERE source_key = ?`).bind(key).first<GrantRow>();
+	const r = await db.prepare(`SELECT g.*, gp.plan_id FROM mbr_grants g LEFT JOIN mbr_grant_plans gp ON gp.grant_id = g.id WHERE g.source_key = ?`).bind(key).first<GrantRow>();
 	return r ? toGrant(r) : null;
 }
 
@@ -88,34 +96,46 @@ export async function grantProTime(db: Db, input: GrantProInput): Promise<GrantP
 	const existing = await grantByKey(db, input.key);
 	if (existing) return { ok: true, created: false, grant: existing, plan: await recomputePlan(db, existing.memberId, opts) };
 
+	const fallback = await fallbackPaidPlan(db);
+	const planId = input.plan?.trim() || fallback;
+	const plan = await getPlan(db, planId);
+	if (!plan || !plan.paid) return { ok: false, reason: "invalid_plan" };
+
 	const member = await db
 		.prepare(
 			`INSERT INTO mbr_members (id, email, plan, created_at) VALUES (?, ?, 'free', ?)
 			 ON CONFLICT (email) DO UPDATE SET email = excluded.email
-			 RETURNING id`,
+			 RETURNING id, created_at`,
 		)
 		.bind(`mbr_${crypto.randomUUID()}`, email, t)
-		.first<{ id: string }>();
+		.first<{ id: string; created_at: number }>();
 	if (!member) throw new Error("memberships: member upsert returned no row");
+	if (member.created_at === t) await emitEvent(db, "member.created", member.id, { email, source: "grant" }, t);
 
-	// Stack after the member's latest active grant, so two rewards make two months.
+	// Stack after the member's latest active grant of the same plan, so two rewards make two months.
 	const last = await db
-		.prepare(`SELECT MAX(ends_at) AS ends_at FROM mbr_grants WHERE member_id = ? AND revoked_at IS NULL AND ends_at > ?`)
-		.bind(member.id, t)
+		.prepare(
+			`SELECT MAX(g.ends_at) AS ends_at FROM mbr_grants g LEFT JOIN mbr_grant_plans gp ON gp.grant_id = g.id
+			 WHERE g.member_id = ? AND g.revoked_at IS NULL AND g.ends_at > ? AND COALESCE(gp.plan_id, ?) = ?`,
+		)
+		.bind(member.id, t, fallback, planId)
 		.first<{ ends_at: number | null }>();
 	const startsAt = Math.max(t, last?.ends_at ?? 0);
 	const endsAt = startsAt + Math.round(input.days * DAY);
 
 	// ON CONFLICT DO NOTHING: two concurrent calls with one key create one grant.
-	const inserted = await db
-		.prepare(
-			`INSERT INTO mbr_grants (id, member_id, source_key, reason, starts_at, ends_at, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (source_key) DO NOTHING RETURNING id`,
-		)
-		.bind(`grt_${crypto.randomUUID()}`, member.id, input.key, input.reason?.slice(0, 300) ?? null, startsAt, endsAt, t)
-		.first<{ id: string }>();
+	const id = `grt_${crypto.randomUUID()}`;
+	const [inserted] = (await db.batch([
+		db
+			.prepare(
+				`INSERT INTO mbr_grants (id, member_id, source_key, reason, starts_at, ends_at, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (source_key) DO NOTHING RETURNING id`,
+			)
+			.bind(id, member.id, input.key, input.reason?.slice(0, 300) ?? null, startsAt, endsAt, t),
+		db.prepare(`INSERT INTO mbr_grant_plans (grant_id, plan_id) SELECT id, ? FROM mbr_grants WHERE id = ?`).bind(planId, id),
+	])) as { results?: unknown[] }[];
 	const grant = (await grantByKey(db, input.key))!;
-	return { ok: true, created: !!inserted, grant, plan: await recomputePlan(db, grant.memberId, opts) };
+	return { ok: true, created: !!inserted?.results?.length, grant, plan: await recomputePlan(db, grant.memberId, opts) };
 }
 
 /** Ends a grant now (e.g. the referrals turned out to be fake). */
@@ -136,7 +156,7 @@ export async function revokeGrant(
 export async function listGrants(db: Db, memberId: string): Promise<ProGrant[]> {
 	await ensureSchema(db);
 	const { results } = await db
-		.prepare(`SELECT * FROM mbr_grants WHERE member_id = ? ORDER BY starts_at DESC`)
+		.prepare(`SELECT g.*, gp.plan_id FROM mbr_grants g LEFT JOIN mbr_grant_plans gp ON gp.grant_id = g.id WHERE g.member_id = ? ORDER BY g.starts_at DESC`)
 		.bind(memberId)
 		.all<GrantRow>();
 	return results.map(toGrant);

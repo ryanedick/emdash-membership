@@ -1,0 +1,100 @@
+---
+/**
+ * Team admin page body: seats, join link, invite, remove, join domain.
+ *
+ *   import TeamManager from "emdash-memberships/components/TeamManager.astro";
+ *   import { getTeam, listSeats, isTeamAdmin, seatsInUse } from "emdash-memberships";
+ *   const team = await getTeam(env.DB, { id: Astro.url.searchParams.get("team") });
+ *   // check isTeamAdmin(env.DB, team.id, Astro.locals.member.id) first
+ *   <TeamManager team={team} seats={await listSeats(env.DB, team.id)} siteUrl={Astro.url.origin} />
+ */
+import type { Team, TeamSeat } from "emdash-memberships";
+
+interface Props {
+	team: Team;
+	seats: TeamSeat[];
+	siteUrl: string;
+	manageAction?: string;
+	seatsAction?: string;
+	joinPath?: string;
+	class?: string;
+}
+
+const { team, seats, siteUrl, manageAction = "/api/team/manage", seatsAction = "/api/billing/team-seats", joinPath = "/team/join", class: className = "" } = Astro.props;
+const used = seats.filter((s) => s.status !== "removed").length;
+const link = `${siteUrl.replace(/\/$/, "")}${joinPath}?token=${team.inviteToken}`;
+const saved = Astro.url.searchParams.get("saved");
+const error = Astro.url.searchParams.get("error");
+---
+
+<div class={`mbr-team ${className}`}>
+	{saved && <p class="mbr-team__notice" role="status">Saved.</p>}
+	{error && <p class="mbr-team__error" role="alert">That didn't work ({error.replace(/_/g, " ")}).</p>}
+	<section>
+		<h2>{team.name}</h2>
+		<p>{used} of {team.seats} seats used.</p>
+		{team.subscriptionId && (
+			<form method="post" action={seatsAction} class="mbr-team__row">
+				<input type="hidden" name="team" value={team.id} />
+				<label>Seats<input name="seats" type="number" min={Math.max(1, used)} max="1000" value={team.seats} /></label>
+				<button class="mbr-button mbr-button--quiet" type="submit">Change seats</button>
+			</form>
+		)}
+	</section>
+	<section>
+		<h3>Invite</h3>
+		<form method="post" action={manageAction} class="mbr-team__row">
+			<input type="hidden" name="team" value={team.id} />
+			<input type="hidden" name="action" value="invite" />
+			<label>Email<input name="email" type="email" required /></label>
+			<button class="mbr-button" type="submit" disabled={used >= team.seats}>Send invite</button>
+		</form>
+		<p>Or share this join link: <code>{link}</code></p>
+		<form method="post" action={manageAction}>
+			<input type="hidden" name="team" value={team.id} />
+			<input type="hidden" name="action" value="rotate-link" />
+			<button class="mbr-button mbr-button--quiet" type="submit">Make a new link (the old one stops working)</button>
+		</form>
+		<form method="post" action={manageAction} class="mbr-team__row">
+			<input type="hidden" name="team" value={team.id} />
+			<input type="hidden" name="action" value="domain" />
+			<label>Anyone with an email at this domain can join<input name="domain" value={team.joinDomain ?? ""} placeholder="example.com" /></label>
+			<button class="mbr-button mbr-button--quiet" type="submit">Save</button>
+		</form>
+	</section>
+	<section>
+		<h3>Members</h3>
+		<ul class="mbr-team__list">
+			{seats.filter((s) => s.status !== "removed").map((s) => (
+				<li>
+					<span>{s.email} · {s.role}{s.status === "invited" ? " · invited" : ""}</span>
+					{s.memberId !== team.ownerMemberId && (
+						<form method="post" action={manageAction}>
+							<input type="hidden" name="team" value={team.id} />
+							<input type="hidden" name="action" value="remove" />
+							<input type="hidden" name="email" value={s.email} />
+							<button class="mbr-button mbr-button--quiet" type="submit">Remove</button>
+						</form>
+					)}
+				</li>
+			))}
+		</ul>
+	</section>
+</div>
+
+<style>
+	.mbr-team { display: grid; gap: 1.25rem; }
+	.mbr-team section { padding: 1.25rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: var(--mbr-radius, 12px); background: var(--mbr-surface, #fff); }
+	.mbr-team h2, .mbr-team h3 { margin: 0 0 0.75rem; }
+	.mbr-team__row { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap; margin: 0.5rem 0; }
+	.mbr-team label { display: grid; gap: 0.25rem; }
+	.mbr-team input { padding: 0.45rem 0.6rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: 8px; font: inherit; }
+	.mbr-team__list { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+	.mbr-team__list li { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
+	.mbr-team__notice { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-notice, #ecfdf5); }
+	.mbr-team__error { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-error-bg, #fef2f2); }
+	.mbr-team code { word-break: break-all; }
+	.mbr-button { display: inline-block; padding: 0.5rem 1rem; border: 0; border-radius: var(--mbr-radius, 999px); background: var(--mbr-accent, #111827); color: var(--mbr-on-accent, #fff); font: inherit; font-weight: 600; cursor: pointer; }
+	.mbr-button--quiet { background: transparent; color: inherit; border: 1px solid var(--mbr-border, #e5e7eb); }
+	.mbr-button[disabled] { opacity: 0.5; cursor: not-allowed; }
+</style>

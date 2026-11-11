@@ -1,5 +1,6 @@
 import { randomToken, sha256Hex } from "./crypto.ts";
 import { type Db, ensureSchema } from "./db.ts";
+import { emitEvent } from "./events.ts";
 import type { LoginEmailSender } from "./email.ts";
 
 export type Plan = "free" | "pro";
@@ -7,9 +8,14 @@ export type Plan = "free" | "pro";
 export interface Member {
 	id: string;
 	email: string;
+	/** "pro" while any paid plan is held. Kept for 0.2 sites; prefer `can(member, entitlement)`. */
 	plan: Plan;
 	createdAt: number;
 	lastLoginAt: number | null;
+	/** Paid plans held (see ./plans.ts). Set on members from sessions and sign-in. */
+	plans?: string[];
+	/** What those plans (and the free plan) grant. Check with `can()`. */
+	entitlements?: string[];
 }
 
 export interface MembershipsConfig {
@@ -75,17 +81,39 @@ interface MemberRow {
 	plan: string;
 	created_at: number;
 	last_login_at: number | null;
+	access_plans?: string | null;
+	access_entitlements?: string | null;
+}
+
+function parseList(json: string | null | undefined): string[] | undefined {
+	if (json == null) return undefined;
+	try {
+		const v = JSON.parse(json);
+		return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+	} catch {
+		return [];
+	}
 }
 
 function toMember(r: MemberRow): Member {
+	const plans = parseList(r.access_plans);
+	const entitlements = parseList(r.access_entitlements);
 	return {
 		id: r.id,
 		email: r.email,
 		plan: r.plan === "pro" ? "pro" : "free",
 		createdAt: r.created_at,
 		lastLoginAt: r.last_login_at,
+		...(entitlements && { plans: plans ?? [], entitlements }),
 	};
 }
+
+/**
+ * Columns that load a member's cached plans and entitlements (`a` is a LEFT
+ * JOIN on mbr_member_access). Members without a cached row get the free plan's.
+ */
+const ACCESS_COLUMNS = `COALESCE(a.plans, '[]') AS access_plans,
+	COALESCE(a.entitlements, (SELECT entitlements FROM mbr_plans WHERE id = 'free'), '[]') AS access_entitlements`;
 
 export function createMemberships(config: MembershipsConfig) {
 	const db = config.db;
@@ -209,7 +237,12 @@ export function createMemberships(config: MembershipsConfig) {
 				.first<MemberRow>();
 			if (!row) throw new Error("memberships: member upsert returned no row");
 
-			const member = toMember(row);
+			const access = await db
+				.prepare(`SELECT ${ACCESS_COLUMNS} FROM (SELECT ? AS member_id) x LEFT JOIN mbr_member_access a ON a.member_id = x.member_id`)
+				.bind(row.id)
+				.first<Pick<MemberRow, "access_plans" | "access_entitlements">>();
+			const member = toMember({ ...row, ...access });
+			if (row.created_at === t) await emitEvent(db, "member.created", member.id, { email: member.email, source: "sign_in" }, t);
 			const session = await createSession(member.id, opts.userAgent);
 			return { ok: true, member, session, next: safeNextPath(link.next_path) };
 		},
@@ -222,8 +255,9 @@ export function createMemberships(config: MembershipsConfig) {
 			const t = now();
 			const row = await db
 				.prepare(
-					`SELECT s.expires_at, m.id, m.email, m.plan, m.created_at, m.last_login_at
+					`SELECT s.expires_at, m.id, m.email, m.plan, m.created_at, m.last_login_at, ${ACCESS_COLUMNS}
 					 FROM mbr_sessions s JOIN mbr_members m ON m.id = s.member_id
+					 LEFT JOIN mbr_member_access a ON a.member_id = m.id
 					 WHERE s.token_hash = ? AND s.expires_at > ?`,
 				)
 				.bind(hash, t)
@@ -249,7 +283,10 @@ export function createMemberships(config: MembershipsConfig) {
 			if (!email) return null;
 			await ensureSchema(db);
 			const row = await db
-				.prepare(`SELECT id, email, plan, created_at, last_login_at FROM mbr_members WHERE email = ?`)
+				.prepare(
+					`SELECT m.id, m.email, m.plan, m.created_at, m.last_login_at, ${ACCESS_COLUMNS}
+					 FROM mbr_members m LEFT JOIN mbr_member_access a ON a.member_id = m.id WHERE m.email = ?`,
+				)
 				.bind(email)
 				.first<MemberRow>();
 			return row ? toMember(row) : null;

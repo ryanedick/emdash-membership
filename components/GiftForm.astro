@@ -1,0 +1,66 @@
+---
+/**
+ * Buy a gift membership. Lists the gift prices (one-time prices with gift days)
+ * and posts to `giftCheckoutRoute`. Also shows a redeem box.
+ *
+ *   import GiftForm from "emdash-memberships/components/GiftForm.astro";
+ *   const plans = await pricingTable(env.DB);
+ *   <GiftForm plans={plans} signedIn={!!Astro.locals.member} />
+ */
+import type { PricingPlan } from "emdash-memberships";
+
+interface Props {
+	plans: PricingPlan[];
+	signedIn: boolean;
+	action?: string;
+	redeemAction?: string;
+	loginPath?: string;
+	class?: string;
+}
+
+const { plans, signedIn, action = "/api/billing/gift-checkout", redeemAction = "/api/gift/redeem", loginPath = "/login", class: className = "" } = Astro.props;
+const gifts = plans.flatMap((p) => p.prices.filter((x) => x.giftDays > 0 && x.available).map((x) => ({ ...x, planName: p.name })));
+const today = new Date().toISOString().slice(0, 10);
+const error = Astro.url.searchParams.get("error");
+const code = Astro.url.searchParams.get("code") ?? "";
+const login = `${loginPath}?next=${encodeURIComponent(Astro.url.pathname + Astro.url.search)}`;
+---
+
+<div class={`mbr-gift ${className}`}>
+	{error && <p class="mbr-gift__error" role="alert">That didn't work ({error.replace(/_/g, " ")}).</p>}
+	{gifts.length > 0 && (
+		signedIn ? (
+			<form method="post" action={action} class="mbr-gift__form">
+				<p class="mbr-gift__title">Give a membership</p>
+				<fieldset>
+					<legend>Gift</legend>
+					{gifts.map((g, i) => <label class="mbr-gift__choice"><input type="radio" name="price" value={g.lookupKey} required checked={i === 0} /> {g.planName}: {g.label}</label>)}
+				</fieldset>
+				<label>Their email (optional: leave blank to get the code yourself)<input name="recipient_email" type="email" /></label>
+				<label>Their name (optional)<input name="recipient_name" maxlength="80" /></label>
+				<label>Message (optional)<textarea name="message" maxlength="1000" rows="3" /></label>
+				<label>Send it on<input name="deliver_on" type="date" min={today} value={today} /></label>
+				<button class="mbr-button" type="submit">Continue to payment</button>
+			</form>
+		) : (
+			<p><a class="mbr-button" href={login}>Sign in to buy a gift</a></p>
+		)
+	)}
+	<form method="post" action={redeemAction} class="mbr-gift__form">
+		<p class="mbr-gift__title">Redeem a gift</p>
+		<label>Gift code<input name="code" value={code} placeholder="XXXX-XXXX-XXXX" required /></label>
+		<button class="mbr-button" type="submit">{signedIn ? "Redeem" : "Sign in and redeem"}</button>
+	</form>
+</div>
+
+<style>
+	.mbr-gift { display: grid; gap: 1.5rem; max-width: 34rem; }
+	.mbr-gift__form { display: grid; gap: 0.75rem; padding: 1.25rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: var(--mbr-radius, 12px); background: var(--mbr-surface, #fff); }
+	.mbr-gift__title { margin: 0; font-weight: 600; font-size: 1.15rem; }
+	.mbr-gift label { display: grid; gap: 0.25rem; }
+	.mbr-gift__choice { display: flex !important; gap: 0.5rem; align-items: center; }
+	.mbr-gift fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 0.35rem; }
+	.mbr-gift input, .mbr-gift textarea { padding: 0.45rem 0.6rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: 8px; font: inherit; }
+	.mbr-gift__error { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-error-bg, #fef2f2); }
+	.mbr-button { display: inline-block; padding: 0.55rem 1.1rem; border: 0; border-radius: var(--mbr-radius, 999px); background: var(--mbr-accent, #111827); color: var(--mbr-on-accent, #fff); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+</style>

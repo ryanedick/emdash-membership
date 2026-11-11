@@ -1,0 +1,178 @@
+---
+/**
+ * A complete account page body: plan and billing, switch plan, cancel or
+ * resume, profile answers, teams, gifts bought, downloads, sign out.
+ *
+ *   import MemberAccount from "emdash-memberships/components/MemberAccount.astro";
+ *   import { accountView } from "emdash-memberships";
+ *   const view = await accountView(env.DB, Astro.locals.member, { billing: billingOrNull });
+ *   <MemberAccount view={view} />
+ *
+ * Each form posts to the routes from `membershipsAstro()`; change the paths if
+ * you mounted them elsewhere. Style with --mbr-* variables or .mbr-account classes.
+ */
+import type { AccountView } from "emdash-memberships";
+
+interface Props {
+	view: AccountView;
+	planNames?: Record<string, string>;
+	paths?: Partial<{
+		portal: string;
+		changePlan: string;
+		resume: string;
+		cancelPage: string;
+		profile: string;
+		teamPage: string;
+		gift: string;
+		redeem: string;
+		download: string;
+		logout: string;
+		pricing: string;
+	}>;
+	class?: string;
+}
+
+const { view, planNames = {}, class: className = "" } = Astro.props;
+const p = {
+	portal: "/api/billing/portal",
+	changePlan: "/api/billing/change-plan",
+	resume: "/api/billing/resume",
+	cancelPage: "/account/cancel",
+	profile: "/api/account/profile",
+	teamPage: "/account/team",
+	gift: "/gift",
+	redeem: "/api/gift/redeem",
+	download: "/download",
+	logout: "/api/auth/logout",
+	pricing: "/pricing",
+	...Astro.props.paths,
+};
+const day = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }) : "");
+const sub = view.billing?.subscription ?? null;
+const live = sub && ["active", "trialing", "past_due"].includes(sub.status);
+const paused = sub?.status === "paused";
+const name = (id: string) => planNames[id] ?? id.charAt(0).toUpperCase() + id.slice(1);
+const notice = Astro.url.searchParams.get("saved") ?? Astro.url.searchParams.get("cancel") ?? Astro.url.searchParams.get("gift") ?? Astro.url.searchParams.get("team");
+const error = Astro.url.searchParams.get("error");
+---
+
+<div class={`mbr-account ${className}`}>
+	{notice && <p class="mbr-account__notice" role="status">Done: {notice.replace(/_/g, " ")}.</p>}
+	{error && <p class="mbr-account__error" role="alert">That didn't work ({error.replace(/_/g, " ")}).</p>}
+
+	<section class="mbr-account__section">
+		<h2>Your plan</h2>
+		<p><strong>{view.plans.length ? view.plans.map(name).join(", ") : "Free"}</strong> · {view.member.email}</p>
+		{sub && (
+			<p class="mbr-account__meta">
+				{sub.status === "trialing" && sub.trialEnd ? `Free trial until ${day(sub.trialEnd)}. ` : ""}
+				{paused ? "Paused. " : sub.cancelAtPeriodEnd ? `Ends ${day(sub.currentPeriodEnd)}. ` : live ? `Renews ${day(sub.currentPeriodEnd)}. ` : ""}
+				{sub.status === "past_due" ? "Your last payment failed; please update your card." : ""}
+			</p>
+		)}
+		{view.billing?.earlyMember && <p class="mbr-account__meta">Early member since {day(view.billing.earlyMemberSince)}.</p>}
+		<div class="mbr-account__row">
+			{view.billing?.hasCustomer && (
+				<form method="post" action={p.portal}><button class="mbr-button" type="submit">Billing and invoices</button></form>
+			)}
+			{(sub?.cancelAtPeriodEnd || paused) && (
+				<form method="post" action={p.resume}><button class="mbr-button" type="submit">{paused ? "Resume now" : "Keep my subscription"}</button></form>
+			)}
+			{!view.plans.length && <a class="mbr-button" href={p.pricing}>See plans</a>}
+		</div>
+		{live && !sub.cancelAtPeriodEnd && view.switchOptions.length > 0 && (
+			<form method="post" action={p.changePlan} class="mbr-account__row">
+				<label>Switch to
+					<select name="price">{view.switchOptions.map((o) => <option value={o.lookupKey}>{o.label}</option>)}</select>
+				</label>
+				<button class="mbr-button mbr-button--quiet" type="submit">Switch</button>
+			</form>
+		)}
+		{live && !sub.cancelAtPeriodEnd && <p><a class="mbr-link" href={p.cancelPage}>Cancel subscription</a></p>}
+	</section>
+
+	{view.profileFields.length > 0 && (
+		<section class="mbr-account__section">
+			<h2>About you</h2>
+			<form method="post" action={p.profile} class="mbr-account__form">
+				{view.profileFields.map((f) => {
+					const v = view.profile[f.key];
+					return f.type === "checkbox" ? (
+						<label class="mbr-account__check"><input type="checkbox" name={f.key} checked={v === true} /> {f.label}</label>
+					) : f.type === "select" ? (
+						<label>{f.label}
+							<select name={f.key} required={f.required}>
+								<option value="">Choose…</option>
+								{f.options.map((o) => <option value={o} selected={v === o}>{o}</option>)}
+							</select>
+						</label>
+					) : f.type === "multiselect" ? (
+						<fieldset><legend>{f.label}</legend>
+							{f.options.map((o) => <label class="mbr-account__check"><input type="checkbox" name={f.key} value={o} checked={Array.isArray(v) && v.includes(o)} /> {o}</label>)}
+						</fieldset>
+					) : f.type === "textarea" ? (
+						<label>{f.label}<textarea name={f.key} required={f.required}>{typeof v === "string" ? v : ""}</textarea></label>
+					) : (
+						<label>{f.label}<input name={f.key} type={f.type === "url" ? "url" : "text"} value={typeof v === "string" ? v : ""} required={f.required} /></label>
+					);
+				})}
+				<button class="mbr-button" type="submit">Save</button>
+			</form>
+		</section>
+	)}
+
+	{view.teams.length > 0 && (
+		<section class="mbr-account__section">
+			<h2>Teams</h2>
+			<ul>{view.teams.map((t) => <li>{t.name} ({t.admin ? <a class="mbr-link" href={`${p.teamPage}?team=${t.id}`}>manage</a> : "member"})</li>)}</ul>
+		</section>
+	)}
+
+	{view.downloads.length > 0 && (
+		<section class="mbr-account__section">
+			<h2>Downloads</h2>
+			<ul class="mbr-account__downloads">
+				{view.downloads.map((d) => (
+					<li>
+						{d.allowed ? <a class="mbr-link" href={`${p.download}/${d.download.id}`}>{d.download.title}</a> : <span>{d.download.title}</span>}
+						{d.download.description && <span class="mbr-account__meta"> · {d.download.description}</span>}
+						{d.remaining !== null && <span class="mbr-account__meta"> · {d.remaining} left</span>}
+						{d.reason === "entitlement" && <span class="mbr-account__meta"> · <a class="mbr-link" href={p.pricing}>upgrade to download</a></span>}
+					</li>
+				))}
+			</ul>
+		</section>
+	)}
+
+	<section class="mbr-account__section">
+		<h2>Gifts</h2>
+		{view.giftsBought.length > 0 && (
+			<ul>{view.giftsBought.map((g) => <li><code>{g.code}</code> · {g.days} days · {g.recipientEmail ?? "no recipient"} · {g.status}</li>)}</ul>
+		)}
+		<form method="post" action={p.redeem} class="mbr-account__row">
+			<label>Have a gift code? <input name="code" placeholder="XXXX-XXXX-XXXX" required /></label>
+			<button class="mbr-button mbr-button--quiet" type="submit">Redeem</button>
+		</form>
+		<p><a class="mbr-link" href={p.gift}>Give a membership</a></p>
+	</section>
+
+	<form method="post" action={p.logout}><button class="mbr-button mbr-button--quiet" type="submit">Sign out</button></form>
+</div>
+
+<style>
+	.mbr-account { display: grid; gap: 1.5rem; }
+	.mbr-account__section { padding: 1.25rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: var(--mbr-radius, 12px); background: var(--mbr-surface, #fff); }
+	.mbr-account__section h2 { margin: 0 0 0.75rem; font-size: 1.1rem; }
+	.mbr-account__meta { color: var(--mbr-muted, #57534e); font-size: 0.95em; }
+	.mbr-account__row { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap; margin: 0.75rem 0; }
+	.mbr-account__form { display: grid; gap: 0.75rem; max-width: 32rem; }
+	.mbr-account__form label, .mbr-account__row label { display: grid; gap: 0.25rem; }
+	.mbr-account__check { display: flex !important; gap: 0.5rem; align-items: center; }
+	.mbr-account__notice { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-notice, #ecfdf5); }
+	.mbr-account__error { padding: 0.75rem 1rem; border-radius: 8px; background: var(--mbr-error-bg, #fef2f2); }
+	.mbr-account input, .mbr-account select, .mbr-account textarea { padding: 0.45rem 0.6rem; border: 1px solid var(--mbr-border, #e5e7eb); border-radius: 8px; font: inherit; }
+	.mbr-account fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 0.35rem; }
+	.mbr-button { display: inline-block; padding: 0.55rem 1.1rem; border: 0; border-radius: var(--mbr-radius, 999px); background: var(--mbr-accent, #111827); color: var(--mbr-on-accent, #fff); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+	.mbr-button--quiet { background: transparent; color: inherit; border: 1px solid var(--mbr-border, #e5e7eb); }
+	.mbr-link { color: inherit; }
+</style>

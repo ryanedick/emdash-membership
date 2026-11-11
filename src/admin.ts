@@ -5,15 +5,12 @@
  * from any other back office.
  */
 import { type Db, ensureSchema } from "./db.ts";
-import { DEFAULT_PRO_STATUSES } from "./launch.ts";
 import type { Member, Plan } from "./memberships.ts";
 import { type ProGrant, listGrants } from "./grants.ts";
+import { emitEvent } from "./events.ts";
+import { DEFAULT_PRO_STATUSES, statusList } from "./status.ts";
 
 const DAY = 24 * 60 * 60 * 1000;
-
-function statusList(statuses: readonly string[]) {
-	return statuses.map((s) => `'${s.replace(/'/g, "")}'`).join(", ");
-}
 
 /** What a recurring price is worth, for the MRR estimate. Keyed by Stripe Price lookup key. */
 export interface PlanValue {
@@ -266,7 +263,12 @@ export async function deleteMember(db: Db, memberId: string, opts: { proStatuses
 	if (live) return { ok: false, reason: "has_subscription" };
 	await db.batch([
 		db.prepare(`DELETE FROM mbr_sessions WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_grant_plans WHERE grant_id IN (SELECT id FROM mbr_grants WHERE member_id = ?)`).bind(memberId),
 		db.prepare(`DELETE FROM mbr_grants WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_member_access WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_mrr_events WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_outbox WHERE member_id = ? OR to_email = ?`).bind(memberId, m.email),
+		db.prepare(`DELETE FROM mbr_subscription_terms WHERE subscription_id IN (SELECT id FROM mbr_subscriptions WHERE member_id = ?)`).bind(memberId),
 		db.prepare(`DELETE FROM mbr_notices WHERE member_id = ?`).bind(memberId),
 		db.prepare(`DELETE FROM mbr_checkouts WHERE member_id = ?`).bind(memberId),
 		db.prepare(`DELETE FROM mbr_subscriptions WHERE member_id = ?`).bind(memberId),
@@ -277,7 +279,14 @@ export async function deleteMember(db: Db, memberId: string, opts: { proStatuses
 			? [db.prepare(`INSERT INTO mbr_plan_changes (member_id, email, plan, changed_at) VALUES (?, ?, 'free', ?)`).bind(memberId, m.email, Date.now())]
 			: []),
 		db.prepare(`DELETE FROM mbr_login_tokens WHERE email = ?`).bind(m.email),
+		db.prepare(`DELETE FROM mbr_profile_values WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_notes WHERE member_id = ?`).bind(memberId),
+		db.prepare(`UPDATE mbr_team_members SET member_id = NULL, status = 'removed' WHERE member_id = ?`).bind(memberId),
+		db.prepare(`DELETE FROM mbr_download_log WHERE member_id = ?`).bind(memberId),
 		db.prepare(`DELETE FROM mbr_members WHERE id = ?`).bind(memberId),
 	]);
+	// The event log keeps only the fact of an erased member, not their data.
+	await db.prepare(`UPDATE mbr_events SET data = '{}' WHERE member_id = ?`).bind(memberId).run();
+	await emitEvent(db, "member.deleted", memberId, {});
 	return { ok: true, email: m.email };
 }

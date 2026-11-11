@@ -1,0 +1,90 @@
+---
+/**
+ * Shown in place of gated content. Pass the decision from `members.access()`.
+ *
+ *   import Paywall from "emdash-memberships/components/Paywall.astro";
+ *   {decision.allowed ? <Body /> : <><Teaser /><Paywall decision={decision} signedIn={!!Astro.locals.member} /></>}
+ *
+ * Style with --mbr-accent, --mbr-surface, --mbr-border, --mbr-radius, or the .mbr-paywall classes.
+ */
+import type { AccessDecision } from "emdash-memberships";
+
+interface Props {
+	decision: Pick<AccessDecision, "reason" | "requires" | "availableAt">;
+	signedIn: boolean;
+	heading?: string;
+	text?: string;
+	pricingPath?: string;
+	loginPath?: string;
+	/** Where to come back to after signing in. Default: the current page. */
+	next?: string;
+	ctaLabel?: string;
+	class?: string;
+}
+
+const {
+	decision,
+	signedIn,
+	heading,
+	text,
+	pricingPath = "/pricing",
+	loginPath = "/login",
+	next = Astro.url.pathname,
+	ctaLabel,
+	class: className = "",
+} = Astro.props;
+
+const day = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }) : "");
+const drip = decision.reason === "drip";
+const signIn = decision.reason === "sign_in_required";
+const title = heading ?? (drip ? "Coming soon for you" : signIn ? "Sign in to keep reading" : "Members only");
+const body =
+	text ??
+	(drip
+		? `This unlocks on ${day(decision.availableAt)}, as part of your membership.`
+		: signIn
+			? "It's free: sign in or create an account with just your email."
+			: "Upgrade your membership to read the rest and everything else in the archive.");
+const login = `${loginPath}?next=${encodeURIComponent(next)}`;
+---
+
+<aside class={`mbr-paywall ${className}`} aria-label={title}>
+	<p class="mbr-paywall__title">{title}</p>
+	<p class="mbr-paywall__text">{body}</p>
+	{!drip && (
+		<p class="mbr-paywall__actions">
+			{signIn ? (
+				<a class="mbr-button" href={login}>{ctaLabel ?? "Sign in"}</a>
+			) : (
+				<>
+					<a class="mbr-button" href={pricingPath}>{ctaLabel ?? "See plans"}</a>
+					{!signedIn && <a class="mbr-link" href={login}>Already a member? Sign in</a>}
+				</>
+			)}
+		</p>
+	)}
+</aside>
+
+<style>
+	.mbr-paywall {
+		margin: 1.5rem 0;
+		padding: 1.5rem;
+		border: 1px solid var(--mbr-border, #e5e7eb);
+		border-radius: var(--mbr-radius, 12px);
+		background: var(--mbr-surface, #fafaf9);
+		text-align: center;
+	}
+	.mbr-paywall__title { margin: 0 0 0.5rem; font-weight: 600; font-size: 1.15rem; }
+	.mbr-paywall__text { margin: 0 0 1rem; color: var(--mbr-muted, #57534e); }
+	.mbr-paywall__actions { margin: 0; display: flex; gap: 1rem; justify-content: center; align-items: center; flex-wrap: wrap; }
+	.mbr-button {
+		display: inline-block;
+		padding: 0.6rem 1.2rem;
+		border-radius: var(--mbr-radius, 999px);
+		background: var(--mbr-accent, #111827);
+		color: var(--mbr-on-accent, #fff);
+		text-decoration: none;
+		font-weight: 600;
+	}
+	.mbr-link { color: inherit; }
+</style>

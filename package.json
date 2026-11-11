@@ -1,7 +1,7 @@
 {
   "name": "emdash-memberships",
-  "version": "0.2.0",
-  "description": "Member accounts for EmDash sites: passwordless magic-link sign-in, sessions, Stripe subscriptions and one-time purchases, comp Pro time, and a Members area in the EmDash admin. Runs on Cloudflare D1.",
+  "version": "0.3.0",
+  "description": "Member accounts for EmDash sites: magic-link sign-in, plans and entitlements, Stripe subscriptions with trials, coupons and revenue reporting, lifecycle emails, comp time, and a Members area in the EmDash admin. Runs on Cloudflare D1.",
   "keywords": [
     "emdash",
     "emdash-plugin",
@@ -25,7 +25,9 @@
     "url": "https://github.com/ryanedick/emdash-membership/issues"
   },
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./components/*.astro"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -47,10 +49,17 @@
       "types": "./dist/plugin/runtime.d.ts",
       "default": "./dist/plugin/runtime.js"
     },
+    "./components/Paywall.astro": "./components/Paywall.astro",
+    "./components/PricingTable.astro": "./components/PricingTable.astro",
+    "./components/MemberAccount.astro": "./components/MemberAccount.astro",
+    "./components/CancelFlow.astro": "./components/CancelFlow.astro",
+    "./components/GiftForm.astro": "./components/GiftForm.astro",
+    "./components/TeamManager.astro": "./components/TeamManager.astro",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "components",
     "src",
     "README.md",
     "LICENSE"
