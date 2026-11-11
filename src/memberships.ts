@@ -196,6 +196,35 @@ export function createMemberships(config: MembershipsConfig) {
 		},
 
 		/**
+		 * Makes a one-time sign-in link without emailing it, for when the visitor has
+		 * just proven they own the address another way (say, by confirming a newsletter
+		 * subscription). Same single use, expiry and verify page as an emailed link;
+		 * not rate limited, so only call it after that proof.
+		 */
+		async createLoginLink(input: {
+			email: string;
+			origin: string;
+			next?: string | null;
+			ip?: string | null;
+		}): Promise<{ ok: true; url: string; token: string } | { ok: false; reason: "invalid_email" }> {
+			const email = normalizeEmail(input.email);
+			if (!email) return { ok: false, reason: "invalid_email" };
+			await ensureSchema(db);
+			const t = now();
+			const token = randomToken();
+			await db
+				.prepare(
+					`INSERT INTO mbr_login_tokens (token_hash, email, next_path, ip, created_at, expires_at)
+					 VALUES (?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(await sha256Hex(token), email, safeNextPath(input.next), input.ip ?? null, t, t + linkTtl)
+				.run();
+			const url = new URL(verifyPath, input.origin);
+			url.searchParams.set("token", token);
+			return { ok: true, url: url.toString(), token };
+		},
+
+		/**
 		 * Checks a link without using it up. The confirm page calls this on GET, so
 		 * email scanners that pre-fetch links can't burn the token.
 		 */

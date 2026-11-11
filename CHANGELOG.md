@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+- `createLoginLink({ email, origin, next })` makes a one-time sign-in link without emailing it, for when the visitor has just proven they own the address another way, such as confirming a newsletter subscription. It uses the same verify page, single use and expiry as an emailed link.
+
 ## 0.4.1
 
 - Fix: on Cloudflare Workers, **Create webhook** and other Stripe calls from the admin failed with `No such module "chunks/stripe"`, and site code couldn't read keys saved on Connections (it quietly fell back to environment variables). Dynamic imports of `stripe`, `emdash` and `cloudflare:workers` are now plain literals that bundlers resolve.

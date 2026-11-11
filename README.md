@@ -463,6 +463,7 @@ import { createMemberships } from "emdash-memberships";
 
 const m = createMemberships({ db: env.DB, sender, verifyPath: "/login/verify" });
 await m.requestLoginLink({ email, origin: url.origin, next, ip });
+await m.createLoginLink({ email, origin: url.origin, next }); // no email: after proving the address another way
 const link = await m.peekLoginLink(token); // GET: check only
 const result = await m.consumeLoginLink(token); // POST: use it, get a session token for your cookie
 const session = await m.getSession(cookieValue); // each request

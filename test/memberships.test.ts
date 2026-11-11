@@ -135,3 +135,25 @@ test("safeNextPath only allows same-site paths", () => {
 	assert.equal(normalizeEmail("  A@B.co "), "a@b.co");
 	assert.equal(normalizeEmail("a@b"), null);
 });
+
+test("createLoginLink: a one-time link without an email, same verify flow", async () => {
+	const { m, sent, advance } = setup();
+	const link = await m.createLoginLink({ email: " New@Example.com ", origin: "https://example.com", next: "/account" });
+	assert.ok(link.ok);
+	assert.equal(sent.length, 0, "nothing is emailed");
+	assert.ok(link.url.startsWith("https://example.com/login/verify?token="));
+	assert.equal(new URL(link.url).searchParams.get("token"), link.token);
+	assert.deepEqual(await m.peekLoginLink(link.token), { email: "new@example.com" });
+	const r = await m.consumeLoginLink(link.token);
+	assert.ok(r.ok);
+	assert.equal(r.member.email, "new@example.com");
+	assert.equal(r.next, "/account");
+	assert.deepEqual(await m.consumeLoginLink(link.token), { ok: false, reason: "invalid_or_expired" });
+
+	// Expires like an emailed link, and rejects bad addresses.
+	const late = await m.createLoginLink({ email: "late@example.com", origin: "https://example.com" });
+	assert.ok(late.ok);
+	advance(16 * 60 * 1000);
+	assert.equal(await m.peekLoginLink(late.token), null);
+	assert.deepEqual(await m.createLoginLink({ email: "nope", origin: "https://example.com" }), { ok: false, reason: "invalid_email" });
+});
