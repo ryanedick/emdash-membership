@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Fix: on Cloudflare Workers, **Create webhook** and other Stripe calls from the admin failed with `No such module "chunks/stripe"`, and site code couldn't read keys saved on Connections (it quietly fell back to environment variables). Dynamic imports of `stripe`, `emdash` and `cloudflare:workers` are now plain literals that bundlers resolve.
+
 ## 0.4.0
 
 Set up from the admin, no environment variables needed.

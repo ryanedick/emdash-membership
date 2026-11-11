@@ -58,7 +58,7 @@ export interface SecretsOptions {
 
 async function workersEnv(): Promise<Record<string, unknown>> {
 	try {
-		return ((await import("cloudflare:workers" as string)) as { env: Record<string, unknown> }).env ?? {};
+		return ((await import("cloudflare:workers")) as { env: Record<string, unknown> }).env ?? {};
 	} catch {
 		return {};
 	}
@@ -66,7 +66,7 @@ async function workersEnv(): Promise<Record<string, unknown>> {
 
 async function emdashRead(key: SettingKey): Promise<unknown> {
 	try {
-		const mod = (await import("emdash" as string)) as { getPluginSetting?: (pluginId: string, key: string) => Promise<unknown> };
+		const mod = (await import("emdash")) as { getPluginSetting?: (pluginId: string, key: string) => Promise<unknown> };
 		return (await mod.getPluginSetting?.(PLUGIN_ID, key)) ?? null;
 	} catch {
 		// Outside an EmDash request (a cron, a test) or no encryption key: fall back to env.

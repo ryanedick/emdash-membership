@@ -28,7 +28,7 @@ const TICK = "memberships-tick";
 
 async function cloudflareEnv(): Promise<Record<string, unknown>> {
 	try {
-		return ((await import("cloudflare:workers" as string)) as { env: Record<string, unknown> }).env ?? {};
+		return ((await import("cloudflare:workers")) as { env: Record<string, unknown> }).env ?? {};
 	} catch {
 		return {};
 	}

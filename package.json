@@ -1,6 +1,6 @@
 {
   "name": "emdash-memberships",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Member accounts for EmDash sites: magic-link sign-in, plans and entitlements, Stripe subscriptions with trials, coupons and revenue reporting, lifecycle emails, comp time, and a Members area in the EmDash admin. Runs on Cloudflare D1.",
   "keywords": [
     "emdash",

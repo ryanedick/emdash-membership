@@ -934,7 +934,7 @@ let stripeClient: { key: string; client: Stripe } | null = null;
 /** A Stripe client for a key, reused across requests in this isolate. Needs the `stripe` package. */
 export async function stripeClientFor(key: string): Promise<Stripe> {
 	if (stripeClient?.key === key) return stripeClient.client;
-	const { default: StripeCtor } = (await import("stripe" as string)) as { default: typeof Stripe };
+	const { default: StripeCtor } = (await import("stripe")) as { default: typeof Stripe };
 	// No apiVersion: the SDK pins the version its types were generated for.
 	const client = new StripeCtor(key, { httpClient: StripeCtor.createFetchHttpClient(), maxNetworkRetries: 2 });
 	stripeClient = { key, client };
